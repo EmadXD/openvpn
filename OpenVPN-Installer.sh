@@ -57,7 +57,6 @@ if [[ -e /etc/openvpn/server/server.conf ]]; then
 		echo
 		exit
 else
-	clear
 	echo 'Install OpenVPN for Multiple Users'
 	echo
 	echo 'Created By JabbariDEV'
