@@ -34,18 +34,18 @@ fi
 
 newclient () {
 	# Generates the custom client.ovpn
-	cp /etc/openvpn/server/client-common.txt ~/$1.ovpn
+	sudo cp /etc/openvpn/server/client-common.txt ~/$1.ovpn
 	echo "<ca>" >> ~/$1.ovpn
-	cat /etc/openvpn/server/easy-rsa/pki/ca.crt >> ~/$1.ovpn
+	sudo cat /etc/openvpn/server/easy-rsa/pki/ca.crt >> ~/$1.ovpn
 	echo "</ca>" >> ~/$1.ovpn
 	echo "<cert>" >> ~/$1.ovpn
-	sed -ne '/BEGIN CERTIFICATE/,$ p' /etc/openvpn/server/easy-rsa/pki/issued/$1.crt >> ~/$1.ovpn
+	sudo sed -ne '/BEGIN CERTIFICATE/,$ p' /etc/openvpn/server/easy-rsa/pki/issued/$1.crt >> ~/$1.ovpn
 	echo "</cert>" >> ~/$1.ovpn
 	echo "<key>" >> ~/$1.ovpn
-	cat /etc/openvpn/server/easy-rsa/pki/private/$1.key >> ~/$1.ovpn
+	sudo cat /etc/openvpn/server/easy-rsa/pki/private/$1.key >> ~/$1.ovpn
 	echo "</key>" >> ~/$1.ovpn
 	echo "<tls-auth>" >> ~/$1.ovpn
-	sed -ne '/BEGIN OpenVPN Static key/,$ p' /etc/openvpn/server/ta.key >> ~/$1.ovpn
+	sudo sed -ne '/BEGIN OpenVPN Static key/,$ p' /etc/openvpn/server/ta.key >> ~/$1.ovpn
 	echo "</tls-auth>" >> ~/$1.ovpn
 }
 
@@ -118,13 +118,13 @@ LimitNPROC=infinity' > /etc/systemd/system/openvpn-server@server.service.d/disab
 	fi
 	# Get easy-rsa
 	EASYRSAURL='https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.5/EasyRSA-nix-3.0.5.tgz'
-	wget -O ~/easyrsa.tgz "$EASYRSAURL" 2>/dev/null || curl -Lo ~/easyrsa.tgz "$EASYRSAURL"
-	tar xzf ~/easyrsa.tgz -C ~/
-	mv ~/EasyRSA-3.0.5/ /etc/openvpn/server/
-	mv /etc/openvpn/server/EasyRSA-3.0.5/ /etc/openvpn/server/easy-rsa/
-	chown -R root:root /etc/openvpn/server/easy-rsa/
-	rm -f ~/easyrsa.tgz
-	cd /etc/openvpn/server/easy-rsa/
+	sudo wget -O ~/easyrsa.tgz "$EASYRSAURL" 2>/dev/null || curl -Lo ~/easyrsa.tgz "$EASYRSAURL"
+	sudo tar xzf ~/easyrsa.tgz -C ~/
+	sudo mv ~/EasyRSA-3.0.5/ /etc/openvpn/server/
+	sudo mv /etc/openvpn/server/EasyRSA-3.0.5/ /etc/openvpn/server/easy-rsa/
+	sudo chown -R root:root /etc/openvpn/server/easy-rsa/
+	sudo rm -f ~/easyrsa.tgz
+	sudo cd /etc/openvpn/server/easy-rsa/
 	# Create the PKI, set up the CA and the server and client certificates
 	./easyrsa init-pki
 	./easyrsa --batch build-ca nopass
@@ -132,11 +132,11 @@ LimitNPROC=infinity' > /etc/systemd/system/openvpn-server@server.service.d/disab
 	EASYRSA_CERT_EXPIRE=3650 ./easyrsa build-client-full $CLIENT nopass
 	EASYRSA_CRL_DAYS=3650 ./easyrsa gen-crl
 	# Move the stuff we need
-	cp pki/ca.crt pki/private/ca.key pki/issued/server.crt pki/private/server.key pki/crl.pem /etc/openvpn/server
+	sudo cp pki/ca.crt pki/private/ca.key pki/issued/server.crt pki/private/server.key pki/crl.pem /etc/openvpn/server
 	# CRL is read with each client connection, when OpenVPN is dropped to nobody
-	chown nobody:$GROUPNAME /etc/openvpn/server/crl.pem
+	sudo chown nobody:$GROUPNAME /etc/openvpn/server/crl.pem
 	# Generate key for tls-auth
-	openvpn --genkey --secret /etc/openvpn/server/ta.key
+	sudo openvpn --genkey --secret /etc/openvpn/server/ta.key
 	# Create the DH parameters file using the predefined ffdhe2048 group
 	echo '-----BEGIN DH PARAMETERS-----
 MIIBCAKCAQEA//////////+t+FRYortKmq/cViAnPTzx2LnFg84tNpWp4TZBFGQz
