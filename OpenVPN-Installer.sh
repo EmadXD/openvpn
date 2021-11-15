@@ -124,7 +124,7 @@ LimitNPROC=infinity' > /etc/systemd/system/openvpn-server@server.service.d/disab
 	sudo mv /etc/openvpn/server/EasyRSA-3.0.5/ /etc/openvpn/server/easy-rsa/
 	sudo chown -R root:root /etc/openvpn/server/easy-rsa/
 	sudo rm -f ~/easyrsa.tgz
-	sudo cd /etc/openvpn/server/easy-rsa/
+	cd /etc/openvpn/server/easy-rsa/
 	# Create the PKI, set up the CA and the server and client certificates
 	./easyrsa init-pki
 	./easyrsa --batch build-ca nopass
