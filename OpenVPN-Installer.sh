@@ -95,7 +95,7 @@ else
 	echo "   3) Google"
 	echo "   4) OpenDNS"
 	echo "   5) Verisign"
-	read -p "DNS [1-5]: " -e -i 2 DNS
+	read -p "DNS [1-5]: " -e -i 1 DNS
 	echo
 	echo "Enter the name Client Certificate (One Word)"
 	read -p "Client name: " -e -i client CLIENT
