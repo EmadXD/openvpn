@@ -76,7 +76,7 @@ else
 	echo "Choose OpenVPN Protocol (default UDP):"
 	echo "   1) UDP (recommended)"
 	echo "   2) TCP"
-	read -p "Protocol [1-2]: " -e -i PROTOCOL
+	read -p "Protocol [1-2]: " -e PROTOCOL
 	case $PROTOCOL in
 		1)
 		PROTOCOL=udp
@@ -95,7 +95,7 @@ else
 	echo "   3) Google"
 	echo "   4) OpenDNS"
 	echo "   5) Verisign"
-	read -p "DNS [1-5]: " -e -i 2 DNS
+	read -p "DNS [1-5]: " -e DNS
 	echo
 	echo "Enter the name Client Certificate (One Word)"
 	read -p "Client name: " -e -i client CLIENT
