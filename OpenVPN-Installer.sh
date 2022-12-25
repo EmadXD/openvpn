@@ -76,7 +76,7 @@ else
 	echo "Choose OpenVPN Protocol (default UDP):"
 	echo "   1) UDP (recommended)"
 	echo "   2) TCP"
-	read -p "Protocol [1-2]: " -e -i 1 PROTOCOL
+	read -p "Protocol [1-2]: " -e -i PROTOCOL
 	case $PROTOCOL in
 		1)
 		PROTOCOL=udp
