@@ -87,7 +87,7 @@ else
 	esac
 	echo
 	echo "Enter OpenVPN Port (default 1194)"
-	read -p "Port: " -e -i 8585 PORT
+	read -p "Port: " -e -i 1194 PORT
 	echo
 	echo "Choose DNS for VPN (default System)"
 	echo "   1) Current system resolvers"
