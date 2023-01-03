@@ -76,7 +76,7 @@ else
 	echo "Choose OpenVPN Protocol (default UDP):"
 	echo "   1) UDP (recommended)"
 	echo "   2) TCP"
-	read -p "Protocol [1-2]: " -e -i 1 PROTOCOL
+	read -p "Protocol [1-2]: " -e -i 2 PROTOCOL
 	case $PROTOCOL in
 		1)
 		PROTOCOL=udp
@@ -87,7 +87,7 @@ else
 	esac
 	echo
 	echo "Enter OpenVPN Port (default 1194)"
-	read -p "Port: " -e -i 8585 PORT
+	read -p "Port: " -e -i 1194 PORT
 	echo
 	echo "Choose DNS for VPN (default System)"
 	echo "   1) Current system resolvers"
@@ -95,7 +95,7 @@ else
 	echo "   3) Google"
 	echo "   4) OpenDNS"
 	echo "   5) Verisign"
-	read -p "DNS [1-5]: " -e -i 1 DNS
+	read -p "DNS [1-5]: " -e -i 2 DNS
 	echo
 	echo "Enter the name Client Certificate (One Word)"
 	read -p "Client name: " -e -i client CLIENT
