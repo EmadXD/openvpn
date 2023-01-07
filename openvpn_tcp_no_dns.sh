@@ -240,7 +240,7 @@ WantedBy=multi-user.target" > /etc/systemd/system/openvpn-iptables.service
 		systemctl enable --now openvpn-iptables.service
 	fi
 	# If SELinux is enabled and a custom port was selected, we need this
-	if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$PORT" != '8585' ]]; then
+	if sestatus 2>/dev/null | grep "Current mode" | grep -q "enforcing" && [[ "$PORT" != '1194' ]]; then
 		# Install semanage if not already present
 		if ! hash semanage 2>/dev/null; then
 			if grep -qs "CentOS Linux release 7" "/etc/centos-release"; then
