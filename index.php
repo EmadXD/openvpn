@@ -1,3 +1,3 @@
 <?php
-header('Location: https://github.com', true);
+header('Location: https://github.com');
 exit;
