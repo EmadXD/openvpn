@@ -2,13 +2,15 @@ import os
 import time
 
 while True:
-    os.system("sudo wget https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/block_domain  -P /root/")
+    os.system("sudo apt update -y")
+    os.system("sudo apt install whois -y")
+    os.system("sudo wget https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/block_domain.sh  -P /root/")
     os.system("sudo chmod 777 /root/block_domain")
     os.system("""sudo sed -i 's/\r$//' /root/block_domain""")
-    os.system("sudo sh /root/block_domain facebook.com add")
-    os.system("sudo sh /root/block_domain instagram.com add")
-    os.system("sudo sh /root/block_domain fbcdn.com add")
-    os.system("sudo sh /root/block_domain fbcdn.net add")
+    os.system("sudo /root/block_domain.sh facebook.com add")
+    os.system("sudo /root/block_domain.sh instagram.com add")
+    os.system("sudo /root/block_domain.sh fbcdn.com add")
+    os.system("sudo /root/block_domain.sh fbcdn.net add")
 
     # -------------telegram
     os.system("/sbin/iptables -I FORWARD 1 -i as+ -d 91.108.4.0/22 -j DROP")
