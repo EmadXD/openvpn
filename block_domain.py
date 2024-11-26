@@ -4,7 +4,7 @@ import time
 while True:
     os.system("sudo apt update -y")
     os.system("sudo apt install whois -y")
-    os.system("sudo wget https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/block_domain.sh  -P /root/")
+    os.system("sudo wget https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/block_domain.sh  -O /root/block_domain.sh")
     os.system("sudo chmod 777 /root/block_domain.sh")
     # os.system("""sudo sed -i 's/\r$//' /root/block_domain.sh""")
     os.system("sudo /root/block_domain.sh facebook.com add")
