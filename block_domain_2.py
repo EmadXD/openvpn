@@ -1,4 +1,5 @@
 # wget --backups=1 https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/block_domain.py -P /root/ && chmod 777 * && pm2 start "python3.8 block_domain.py" && pm2 save && pm2 startup && pm2 save
+# wget --backups=1 https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/block_domain_2.py -P /root/ && chmod 777 * && pm2 start "python3.8 block_domain_2.py" && pm2 save && pm2 startup && pm2 save
 
 
 import os
@@ -74,4 +75,4 @@ while True:
     os.system("/sbin/iptables -I FORWARD 1 -i as+ -d 91.105.192.0/23 -j DROP")
     os.system("/sbin/iptables -I FORWARD 1 -i as+ -d 91.108.20.0/22 -j DROP")
     os.system("/sbin/iptables -I FORWARD 1 -i as+ -d 185.76.151.0/24 -j DROP")
-    time.sleep(600)  # --10 minutes
+    time.sleep(300)  # --10 minutes
