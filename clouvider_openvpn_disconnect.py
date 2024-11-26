@@ -19,6 +19,9 @@ def disconnect_users():
         # مدت زمان مجاز (۲ دقیقه) به ثانیه
         timeout_threshold = 2 * 60  # ۲ دقیقه به ثانیه
 
+        # یک لیست برای ذخیره آدرس‌های IP که باید مسدود شوند
+        blocked_ips = []
+
         # پیمایش تمام بخش‌های openvpn_x
         for key in vpn_data:
             if key.startswith('openvpn_'):  # فقط بخش‌های openvpn_x را پردازش می‌کنیم
@@ -35,18 +38,28 @@ def disconnect_users():
                     # اگر زمان اتصال بیشتر از ۲ دقیقه باشد
                     if connection_duration > timeout_threshold:
                         real_address = client[2]  # آدرس واقعی کاربر (آدرس IP و پورت)
-                        print(f"قطع اتصال کاربر {real_address} که بیش از ۲ دقیقه است متصل است.")
+                        # print(f"قطع اتصال کاربر {real_address} که بیش از ۲ دقیقه است متصل است.")
 
                         # استخراج آدرس IP از رشته (برای مثال "46.246.98.88:55960" -> "46.246.98.88")
+                        ip_address = real_address.split(":")[0].strip()  # حذف فضای اضافی
 
-                        # اجرای دستور iptables برای مسدود کردن ترافیک این کاربر
-                        iptables_command = ['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', real_address, '-j', 'DROP']
-                        subprocess.run(iptables_command)
-                        print(f"ترافیک به IP {real_address} قطع شد.")
+                        # اضافه کردن آدرس IP به لیست مسدود شده
+                        if ip_address not in blocked_ips:
+                            blocked_ips.append(ip_address)
+
+        # اگر لیستی از آدرس‌های IP مسدود شده وجود داشته باشد
+        if blocked_ips:
+            # اجرای دستور iptables برای مسدود کردن تمام آدرس‌ها به صورت یکجا
+            # حذف فضای اضافی بین آدرس‌های IP
+
+            iptables_command = ['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', ','.join(blocked_ips), '-j', 'DROP']
+
+            subprocess.run(iptables_command)
+            print(f"ترافیک به تعداد آدرس‌های IP مسدود شد: {len(blocked_ips)}")
     else:
         print("خطا در دریافت داده‌های OpenVPN.")
 
 
 while True:
     disconnect_users()
-    time.sleep(120)
+    time.sleep(60)
