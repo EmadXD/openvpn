@@ -3,12 +3,8 @@ from datetime import datetime
 import subprocess
 import os
 
-# مسیر فایل وضعیت OpenVPN (مطمئن شو این مسیر با کانفیگ سرورت یکی باشه)
 STATUS_FILE = "/var/log/openvpn/status.log"
-# حداکثر زمان مجاز اتصال (به ثانیه)
 TIMEOUT_SECONDS = 2 * 60
-
-# ذخیره آی‌پی‌هایی که قبلاً بلاک شدن (برای جلوگیری از بلاک دوباره)
 BLOCKED_IPS_FILE = "blocked_ips.txt"
 
 
@@ -27,7 +23,6 @@ def save_blocked_ips(ips):
 
 def disconnect_users():
     try:
-        # بارگذاری آی‌پی‌های بلاک شده قبلی
         blocked_ips = load_blocked_ips()
 
         with open(STATUS_FILE, 'r') as f:
@@ -38,10 +33,13 @@ def disconnect_users():
                 continue
 
             parts = line.strip().split(',')
+
             if len(parts) < 4:
                 continue
 
-            _, _, real_address, connected_since = parts
+            real_address = parts[0]
+            connected_since = parts[3]
+
             try:
                 connected_time = datetime.strptime(connected_since, "%Y-%m-%d %H:%M:%S")
             except ValueError:
