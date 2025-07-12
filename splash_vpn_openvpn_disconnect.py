@@ -4,7 +4,7 @@ import subprocess
 import os
 
 # مسیر فایل وضعیت OpenVPN (مطمئن شو این مسیر با کانفیگ سرورت یکی باشه)
-STATUS_FILE = "/etc/openvpn/logs/status.log"
+STATUS_FILE = "/var/log/openvpn/status.log"
 # حداکثر زمان مجاز اتصال (به ثانیه)
 TIMEOUT_SECONDS = 2 * 60
 
