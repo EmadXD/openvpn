@@ -8,7 +8,6 @@ STATUS_FILE = "/var/log/openvpn/status.log"
 TIMEOUT_SECONDS = 2 * 60  # 2 دقیقه
 BLOCKED_IPS_FILE = "blocked_ips.txt"
 
-# پاک کردن فایل blocked_ips.txt در شروع
 if os.path.exists(BLOCKED_IPS_FILE):
     open(BLOCKED_IPS_FILE, "w").close()
 
@@ -69,30 +68,24 @@ def disconnect_users():
             real_address = client["real_address"]
             connected_since = client["connected_since"]
 
-            # پیدا کردن IP اختصاص‌یافته (Virtual Address)
             virtual_address = routing_table.get(real_address)
             if not virtual_address or not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", virtual_address):
                 continue
 
-            # تبدیل زمان اتصال به شیء datetime
             try:
                 connected_time = datetime.strptime(connected_since, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
 
-            # محاسبه مدت اتصال
             duration = (current_time - connected_time).total_seconds()
 
-            # بررسی مدت اتصال و قطع ترافیک
             if duration > TIMEOUT_SECONDS and virtual_address not in blocked_ips:
                 print(f"قطع اتصال کاربر با IP اختصاص‌یافته {virtual_address} (مدت اتصال: {int(duration)} ثانیه)")
 
-                # اضافه کردن قانون iptables برای قطع ترافیک
                 subprocess.run(['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', virtual_address, '-j', 'DROP'])
                 blocked_ips.add(virtual_address)
                 print(f"ترافیک به IP {virtual_address} قطع شد.")
 
-        # ذخیره IPهای مسدود شده
         try:
             save_blocked_ips(blocked_ips)
         except Exception as e:
@@ -102,7 +95,6 @@ def disconnect_users():
         print(f"خطا در پردازش: {e}")
 
 
-# لوپ اصلی
 while True:
     try:
         disconnect_users()
