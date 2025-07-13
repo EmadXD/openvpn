@@ -116,7 +116,7 @@ function installUnbound() {
 
 			# Configuration
 			echo 'interface: 10.8.0.1
-access-control: 10.8.0.1/24 allow
+access-control: 10.8.0.1/20 allow
 hide-identity: yes
 hide-version: yes
 use-caps-for-id: yes
@@ -127,7 +127,7 @@ prefetch: yes' >>/etc/unbound/unbound.conf
 
 			# Configuration
 			sed -i 's|# interface: 0.0.0.0$|interface: 10.8.0.1|' /etc/unbound/unbound.conf
-			sed -i 's|# access-control: 127.0.0.0/8 allow|access-control: 10.8.0.1/24 allow|' /etc/unbound/unbound.conf
+			sed -i 's|# access-control: 127.0.0.0/8 allow|access-control: 10.8.0.1/20 allow|' /etc/unbound/unbound.conf
 			sed -i 's|# hide-identity: no|hide-identity: yes|' /etc/unbound/unbound.conf
 			sed -i 's|# hide-version: no|hide-version: yes|' /etc/unbound/unbound.conf
 			sed -i 's|use-caps-for-id: no|use-caps-for-id: yes|' /etc/unbound/unbound.conf
@@ -137,7 +137,7 @@ prefetch: yes' >>/etc/unbound/unbound.conf
 
 			# Configuration
 			sed -i 's|# interface: 0.0.0.0$|interface: 10.8.0.1|' /etc/unbound/unbound.conf
-			sed -i 's|# access-control: 127.0.0.0/8 allow|access-control: 10.8.0.1/24 allow|' /etc/unbound/unbound.conf
+			sed -i 's|# access-control: 127.0.0.0/8 allow|access-control: 10.8.0.1/20 allow|' /etc/unbound/unbound.conf
 			sed -i 's|# hide-identity: no|hide-identity: yes|' /etc/unbound/unbound.conf
 			sed -i 's|# hide-version: no|hide-version: yes|' /etc/unbound/unbound.conf
 			sed -i 's|# use-caps-for-id: no|use-caps-for-id: yes|' /etc/unbound/unbound.conf
@@ -160,7 +160,7 @@ prefetch: yes' >>/etc/unbound/unbound.conf
 	trust-anchor-file: trusted-key.key
 	root-hints: root.hints
 	interface: 10.8.0.1
-	access-control: 10.8.0.1/24 allow
+	access-control: 10.8.0.1/20 allow
 	port: 53
 	num-threads: 2
 	use-caps-for-id: yes
@@ -195,7 +195,7 @@ private-address: ::ffff:0:0/96" >>/etc/unbound/unbound.conf
 		# Add Unbound 'server' for the OpenVPN subnet
 		echo 'server:
 interface: 10.8.0.1
-access-control: 10.8.0.1/24 allow
+access-control: 10.8.0.1/20 allow
 hide-identity: yes
 hide-version: yes
 use-caps-for-id: yes
