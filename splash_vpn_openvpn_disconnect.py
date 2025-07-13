@@ -85,6 +85,9 @@ def disconnect_users():
                 subprocess.run(['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', virtual_address, '-j', 'DROP'])
                 blocked_ips.add(virtual_address)
                 print(f"IP {virtual_address} disconnected.")
+            else:
+                subprocess.run(['sudo', 'iptables', '-D', 'FORWARD', '-d', virtual_address, '-j', 'DROP'])
+                blocked_ips.discard(virtual_address)
 
         # ------------------
         # حذف IPهای غیرفعال از لیست بلاک و iptables
