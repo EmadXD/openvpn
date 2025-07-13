@@ -1,15 +1,16 @@
 import re
-
 import time
 from datetime import datetime
 import subprocess
 import os
 
 STATUS_FILE = "/var/log/openvpn/status.log"
-TIMEOUT_SECONDS = 2 * 60
+TIMEOUT_SECONDS = 2 * 60  # 2 دقیقه
 BLOCKED_IPS_FILE = "blocked_ips.txt"
 
-open(BLOCKED_IPS_FILE, "w").close()
+# پاک کردن فایل blocked_ips.txt در شروع
+if os.path.exists(BLOCKED_IPS_FILE):
+    open(BLOCKED_IPS_FILE, "w").close()
 
 
 def load_blocked_ips():
@@ -25,62 +26,86 @@ def save_blocked_ips(ips):
             f.write(ip + "\n")
 
 
+def parse_status_file():
+    client_list = []
+    routing_table = {}
+
+    with open(STATUS_FILE, 'r') as f:
+        lines = f.readlines()
+
+    for line in lines:
+        line = line.strip()
+
+        if line.startswith("client"):
+            parts = line.split(',')
+            if len(parts) >= 5:
+                common_name = parts[0]
+                real_address = parts[1]
+                connected_since = parts[4]
+                client_list.append({
+                    "real_address": real_address,
+                    "connected_since": connected_since
+                })
+
+        if line.startswith("10."):
+            parts = line.split(',')
+            if len(parts) >= 3:
+                virtual_address = parts[0]
+                real_address = parts[2]
+                routing_table[real_address] = virtual_address
+
+    return client_list, routing_table
+
+
 def disconnect_users():
     try:
-        try:
-            blocked_ips = load_blocked_ips()
-        except:
-            blocked_ips = set()
+        blocked_ips = load_blocked_ips()
+        client_list, routing_table = parse_status_file()
+        print(client_list, routing_table)
 
-        with open(STATUS_FILE, 'r') as f:
-            lines = f.readlines()
+        current_time = datetime.now()
 
-        for line in lines:
-            if not line.strip() or line.startswith('TITLE') or ',' not in line:
+        for client in client_list:
+            real_address = client["real_address"]
+            connected_since = client["connected_since"]
+
+            # پیدا کردن IP اختصاص‌یافته (Virtual Address)
+            virtual_address = routing_table.get(real_address)
+            if not virtual_address or not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", virtual_address):
                 continue
 
-            parts = line.strip().split(',')
-
-            if len(parts) < 4:
-                continue
-
-            real_address = parts[0]
-            if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", real_address):
-                continue
-
-            connected_since = parts[3]
-
+            # تبدیل زمان اتصال به شیء datetime
             try:
                 connected_time = datetime.strptime(connected_since, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
-            current_time = datetime.now()
-            print(current_time, connected_time)
 
+            # محاسبه مدت اتصال
             duration = (current_time - connected_time).total_seconds()
 
-            # ip_only = real_address.split(':')[0]
-            ip_only = real_address
+            # بررسی مدت اتصال و قطع ترافیک
+            if duration > TIMEOUT_SECONDS and virtual_address not in blocked_ips:
+                print(f"قطع اتصال کاربر با IP اختصاص‌یافته {virtual_address} (مدت اتصال: {int(duration)} ثانیه)")
 
-            if duration > TIMEOUT_SECONDS and ip_only not in blocked_ips:
-                print(f"قطع اتصال کاربر {ip_only} (مدت اتصال: {int(duration)} ثانیه)")
+                # اضافه کردن قانون iptables برای قطع ترافیک
+                subprocess.run(['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', virtual_address, '-j', 'DROP'])
+                blocked_ips.add(virtual_address)
+                print(f"ترافیک به IP {virtual_address} قطع شد.")
 
-                subprocess.run(['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', ip_only, '-j', 'DROP'])
-                blocked_ips.add(ip_only)
-                print(f"ترافیک به IP {ip_only} قطع شد.")
-
+        # ذخیره IPهای مسدود شده
         try:
             save_blocked_ips(blocked_ips)
-        except:
-            print("-")
+        except Exception as e:
+            print(f"خطا در ذخیره فایل blocked_ips: {e}")
 
     except Exception as e:
         print(f"خطا در پردازش: {e}")
 
 
+# لوپ اصلی
 while True:
     try:
         disconnect_users()
         time.sleep(60)
-    except:
-        print("-")
+    except Exception as e:
+        print(f"خطا در لوپ اصلی: {e}")
