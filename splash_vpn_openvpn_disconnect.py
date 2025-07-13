@@ -82,7 +82,16 @@ def disconnect_users():
             if duration > TIMEOUT_SECONDS and virtual_address not in blocked_ips:
                 print(f"disconnect {virtual_address} (time: {int(duration)} sec)")
 
-                subprocess.run(['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', virtual_address, '-j', 'DROP'])
+                # subprocess.run(['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', virtual_address, '-j', 'DROP'])
+                # ----
+                result = subprocess.run(['sudo', 'iptables', '-C', 'FORWARD', '-d', virtual_address, '-j', 'DROP'],
+                                        capture_output=True)
+                if result.returncode != 0:  # rule not exist
+                    subprocess.run(['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', virtual_address, '-j', 'DROP'])
+                    print(f"IP {virtual_address} disconnected.")
+                else:
+                    print(f"ip rule {virtual_address} exist.")
+                # ----
                 blocked_ips.add(virtual_address)
                 print(f"IP {virtual_address} disconnected.")
             else:
