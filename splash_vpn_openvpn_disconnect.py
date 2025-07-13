@@ -23,7 +23,10 @@ def save_blocked_ips(ips):
 
 def disconnect_users():
     try:
-        blocked_ips = load_blocked_ips()
+        try:
+            blocked_ips = load_blocked_ips()
+        except:
+            blocked_ips = set()
 
         with open(STATUS_FILE, 'r') as f:
             lines = f.readlines()
@@ -57,12 +60,18 @@ def disconnect_users():
                 blocked_ips.add(ip_only)
                 print(f"ترافیک به IP {ip_only} قطع شد.")
 
-        save_blocked_ips(blocked_ips)
+        try:
+            save_blocked_ips(blocked_ips)
+        except:
+            print("-")
 
     except Exception as e:
         print(f"خطا در پردازش: {e}")
 
 
 while True:
-    disconnect_users()
-    time.sleep(120)
+    try:
+        disconnect_users()
+        time.sleep(60)
+    except:
+        print("-")
