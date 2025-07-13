@@ -80,11 +80,21 @@ def disconnect_users():
             duration = (current_time - connected_time).total_seconds()
 
             if duration > TIMEOUT_SECONDS and virtual_address not in blocked_ips:
-                print(f"قطع اتصال کاربر با IP اختصاص‌یافته {virtual_address} (مدت اتصال: {int(duration)} ثانیه)")
+                print(f"disconnect {virtual_address} (time: {int(duration)} sec)")
 
                 subprocess.run(['sudo', 'iptables', '-I', 'FORWARD', '1', '-d', virtual_address, '-j', 'DROP'])
                 blocked_ips.add(virtual_address)
-                print(f"ترافیک به IP {virtual_address} قطع شد.")
+                print(f"IP {virtual_address} disconnected.")
+
+        # ------------------
+        # حذف IPهای غیرفعال از لیست بلاک و iptables
+        active_virtual_ips = {client["virtual_address"] for client in client_list}
+        for blocked_ip in blocked_ips.copy():
+            if blocked_ip not in active_virtual_ips:
+                print(f"del ip {blocked_ip} from iptables")
+                subprocess.run(['sudo', 'iptables', '-D', 'FORWARD', '-d', blocked_ip, '-j', 'DROP'])
+                blocked_ips.discard(blocked_ip)
+        # ------------------
 
         try:
             save_blocked_ips(blocked_ips)
