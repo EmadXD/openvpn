@@ -7,6 +7,8 @@ STATUS_FILE = "/var/log/openvpn/status.log"
 TIMEOUT_SECONDS = 2 * 60
 BLOCKED_IPS_FILE = "blocked_ips.txt"
 
+open(BLOCKED_IPS_FILE, "w").close()
+
 
 def load_blocked_ips():
     if os.path.exists(BLOCKED_IPS_FILE):
