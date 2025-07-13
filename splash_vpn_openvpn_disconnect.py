@@ -1,3 +1,5 @@
+import re
+
 import time
 from datetime import datetime
 import subprocess
@@ -43,17 +45,22 @@ def disconnect_users():
                 continue
 
             real_address = parts[0]
+            if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", real_address):
+                continue
+
             connected_since = parts[3]
 
             try:
                 connected_time = datetime.strptime(connected_since, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 continue
-
             current_time = datetime.now()
+            print(current_time, connected_time)
+
             duration = (current_time - connected_time).total_seconds()
 
-            ip_only = real_address.split(':')[0]
+            # ip_only = real_address.split(':')[0]
+            ip_only = real_address
 
             if duration > TIMEOUT_SECONDS and ip_only not in blocked_ips:
                 print(f"قطع اتصال کاربر {ip_only} (مدت اتصال: {int(duration)} ثانیه)")
