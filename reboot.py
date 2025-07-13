@@ -11,7 +11,7 @@ def should_reboot():
     # دریافت زمان فعلی به وقت تهران
     now = datetime.now(tehran_tz)
     # بررسی بازه زمانی بین 4 صبح تا 6 صبح
-    if now.hour >= 4 and now.hour < 8:
+    if now.hour >= 4 and now.hour < 5:
         return False
     return True
 
