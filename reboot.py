@@ -1,5 +1,7 @@
 import os
 import random
+import subprocess
+
 import time
 from datetime import datetime
 import pytz
@@ -49,6 +51,16 @@ def safe_get_with_retries(path, retries=5, delay=5):
     return None
 
 
+def get_main_ip():
+    try:
+        result = subprocess.check_output("hostname -I | awk '{print $1}'", shell=True)
+        ip = result.decode().strip()
+        return ip
+    except Exception as e:
+        print(f"Error getting IP: {e}")
+        return None
+
+
 if __name__ == "__main__":
     while True:
         try:
@@ -56,12 +68,13 @@ if __name__ == "__main__":
             time.sleep(30)
             os.system("sudo pip3 install requests")
             time.sleep(30)
+            self_ip = get_main_ip()
 
-            safe_get_with_retries("/XDvpn/api_v1/offline_online.php?id_key=1382&offline_online=online")
+            safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=online")
 
             time.sleep(random.randint(2500, 5000))
 
-            safe_get_with_retries("/XDvpn/api_v1/offline_online.php?id_key=1382&offline_online=offline")
+            safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?id_key={self_ip}&offline_online=offline")
 
             time.sleep(30)
 
