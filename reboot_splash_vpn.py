@@ -5,10 +5,8 @@ from datetime import datetime
 import pytz
 import requests
 
-# تنظیم منطقه زمانی تهران
 tehran_tz = pytz.timezone("Asia/Tehran")
 
-# لیست دامنه‌ها
 domains = [
     "https://aparatvpn.com",
     "https://us.xdvpn.com",
@@ -33,7 +31,6 @@ def reboot_server():
 
 
 def safe_get_with_retries(path, retries=5, delay=5):
-    """درخواست GET با حداکثر ۵ بار تلاش با دامنه‌های تصادفی"""
     for attempt in range(1, retries + 1):
         domain = random.choice(domains)
         url = f"{domain}{path}"
@@ -55,19 +52,15 @@ def safe_get_with_retries(path, retries=5, delay=5):
 if __name__ == "__main__":
     while True:
         try:
-            # نصب pip و requests در هر چرخه (پیشنهاد نمی‌شود اما طبق کد شما باقی مانده)
             os.system("sudo apt install python3-pip -y")
             time.sleep(30)
             os.system("sudo pip3 install requests")
             time.sleep(30)
 
-            # ارسال آنلاین
             safe_get_with_retries("/XDvpn/api_v1/offline_online.php?id_key=1382&offline_online=online")
 
-            # انتظار بین 15 تا 30 دقیقه
             time.sleep(random.randint(900, 1800))
 
-            # ارسال آفلاین
             safe_get_with_retries("/XDvpn/api_v1/offline_online.php?id_key=1382&offline_online=offline")
 
             time.sleep(30)
