@@ -31,7 +31,6 @@ def reboot_server():
 
 
 def safe_get_with_retries(path, retries=5, delay=5):
-    """درخواست GET با حداکثر ۵ بار تلاش با دامنه‌های تصادفی"""
     for attempt in range(1, retries + 1):
         domain = random.choice(domains)
         url = f"{domain}{path}"
