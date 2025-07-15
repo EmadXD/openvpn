@@ -1,18 +1,24 @@
 import os
+import random
 import time
 from datetime import datetime
 import pytz
+import requests
 
 # تنظیم منطقه زمانی تهران
 tehran_tz = pytz.timezone("Asia/Tehran")
 
+# لیست دامنه‌ها
+domains = [
+    "https://aparatvpn.com",
+    "https://us.xdvpn.com",
+]
+
 
 def should_reboot():
-    # دریافت زمان فعلی به وقت تهران
     try:
         now = datetime.now(tehran_tz)
-        # بررسی بازه زمانی بین 4 صبح تا 6 صبح
-        if now.hour >= 4 and now.hour < 5:
+        if 4 <= now.hour < 5:
             return False
         return True
     except:
@@ -20,22 +26,54 @@ def should_reboot():
 
 
 def reboot_server():
-    # اجرای دستور ریبوت
     try:
         os.system("sudo reboot")
     except:
         print("-")
 
 
+def safe_get_with_retries(path, retries=5, delay=5):
+    """درخواست GET با حداکثر ۵ بار تلاش با دامنه‌های تصادفی"""
+    for attempt in range(1, retries + 1):
+        domain = random.choice(domains)
+        url = f"{domain}{path}"
+        try:
+            print(f"[{attempt}] Trying: {url}")
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                print(f"[✓] Success on attempt {attempt}")
+                return response
+            else:
+                print(f"[!] Status code {response.status_code}")
+        except Exception as e:
+            print(f"[!] Error on attempt {attempt}: {e}")
+        time.sleep(delay)
+    print("[✗] All retries failed.")
+    return None
+
+
 if __name__ == "__main__":
     while True:
         try:
-            time.sleep(1000)
-            if should_reboot():
-                print("Rebooting the server...")
-                reboot_server()
-            else:
-                print("Skipping reboot during restricted hours (4 AM to 6 AM Tehran time).")
-        except:
-            print("--")
-        # صبر کردن برای یک ساعت (3600 ثانیه)
+            # نصب pip و requests در هر چرخه (پیشنهاد نمی‌شود اما طبق کد شما باقی مانده)
+            os.system("sudo apt install python3-pip -y")
+            time.sleep(30)
+            os.system("sudo pip3 install requests")
+            time.sleep(30)
+
+            # ارسال آنلاین
+            safe_get_with_retries("/XDvpn/api_v1/offline_online.php?id_key=1382&offline_online=online")
+
+            # انتظار بین 15 تا 30 دقیقه
+            time.sleep(random.randint(900, 1800))
+
+            # ارسال آفلاین
+            safe_get_with_retries("/XDvpn/api_v1/offline_online.php?id_key=1382&offline_online=offline")
+
+            time.sleep(30)
+
+            print("Rebooting the server...")
+            reboot_server()
+
+        except Exception as e:
+            print(f"-- Exception in main loop: {e}")
