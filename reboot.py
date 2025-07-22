@@ -72,7 +72,7 @@ if __name__ == "__main__":
 
             safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=online")
 
-            time.sleep(random.randint(5000, 7000))
+            time.sleep(random.randint(6000, 9000))
 
             safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=offline")
 
