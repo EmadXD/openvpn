@@ -1,29 +1,12 @@
 import os
 import random
 import subprocess
-
 import time
-from datetime import datetime
-import pytz
-import requests
-
-tehran_tz = pytz.timezone("Asia/Tehran")
 
 domains = [
     "https://aparatvpn.com",
     "https://us.xdvpn.com",
 ]
-
-
-def should_reboot():
-    try:
-        now = datetime.now(tehran_tz)
-        if 4 <= now.hour < 5:
-            return False
-        return True
-    except:
-        return True
-
 
 def reboot_server():
     try:
@@ -38,6 +21,7 @@ def safe_get_with_retries(path, retries=5, delay=5):
         url = f"{domain}{path}"
         try:
             print(f"[{attempt}] Trying: {url}")
+            import requests
             response = requests.get(url, timeout=10)
             if response.status_code == 200:
                 print(f"[✓] Success on attempt {attempt}")
