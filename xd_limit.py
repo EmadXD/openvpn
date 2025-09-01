@@ -6,7 +6,7 @@ def run_command(command, check=True):
     """Run a shell command and handle errors."""
     try:
         result = subprocess.run(command, shell=True, check=check, text=True, capture_output=True)
-        return result.stdout
+        return result.stdout.strip()
     except subprocess.CalledProcessError as e:
         print(f"Error running command '{command}': {e.stderr}")
         sys.exit(1)
@@ -17,6 +17,10 @@ def append_to_file(file_path, content):
         f.seek(0)
         if content not in f.read():
             f.write(content + '\n')
+
+def get_default_interface():
+    """Get the default network interface."""
+    return run_command("ip route | grep default | awk '{print $5}'")
 
 def main():
     # Ensure script is run as root
@@ -69,18 +73,23 @@ LimitNOFILESoft=1048576
     run_command('systemctl daemon-reload')
     run_command('systemctl restart redsocks')
 
-    # Step 5: Run iptables command
+    # Step 5: Run iptables command with dynamic interface
     print("Running iptables command to delete POSTROUTING rule...")
-    iptables_cmd = "iptables -t nat -D POSTROUTING -s 10.8.0.0/20 -o ens16 -j MASQUERADE"
+    default_interface = get_default_interface()
+    if not default_interface:
+        print("Error: Could not determine default network interface.")
+        sys.exit(1)
+    iptables_cmd = f"iptables -t nat -D POSTROUTING -s 10.8.0.0/20 -o {default_interface} -j MASQUERADE"
     try:
         run_command(iptables_cmd, check=False)  # Don't fail if rule doesn't exist
+        print(f"iptables rule for interface {default_interface} deleted (if it existed).")
     except subprocess.CalledProcessError:
         print("Note: iptables rule may not exist, continuing...")
 
     # Step 6: Verify the changes
     print("Verifying file descriptor limits for redsocks...")
     try:
-        pid = run_command('pidof redsocks').strip()
+        pid = run_command('pidof redsocks')
         if pid:
             limits = run_command(f'cat /proc/{pid}/limits | grep "Max open files"')
             print(limits.strip())
