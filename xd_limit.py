@@ -73,19 +73,6 @@ LimitNOFILESoft=1048576
     run_command('systemctl daemon-reload')
     run_command('systemctl restart redsocks')
 
-    # Step 5: Run iptables command with dynamic interface
-    print("Running iptables command to delete POSTROUTING rule...")
-    default_interface = get_default_interface()
-    if not default_interface:
-        print("Error: Could not determine default network interface.")
-        sys.exit(1)
-    iptables_cmd = f"iptables -t nat -D POSTROUTING -s 10.8.0.0/20 -o {default_interface} -j MASQUERADE"
-    try:
-        run_command(iptables_cmd, check=False)  # Don't fail if rule doesn't exist
-        print(f"iptables rule for interface {default_interface} deleted (if it existed).")
-    except subprocess.CalledProcessError:
-        print("Note: iptables rule may not exist, continuing...")
-
     # Step 6: Verify the changes
     print("Verifying file descriptor limits for redsocks...")
     try:
