@@ -2,6 +2,7 @@ import subprocess
 import os
 import sys
 
+
 def run_command(command, check=True):
     """Run a shell command and handle errors."""
     try:
@@ -11,6 +12,7 @@ def run_command(command, check=True):
         print(f"Error running command '{command}': {e.stderr}")
         sys.exit(1)
 
+
 def append_to_file(file_path, content):
     """Append content to a file if it doesn't already exist."""
     with open(file_path, 'a+') as f:
@@ -18,9 +20,11 @@ def append_to_file(file_path, content):
         if content not in f.read():
             f.write(content + '\n')
 
+
 def get_default_interface():
     """Get the default network interface."""
     return run_command("ip route | grep default | awk '{print $5}'")
+
 
 def main():
     # Ensure script is run as root
@@ -91,5 +95,10 @@ LimitNOFILESoft=1048576
     print("Configuration complete. It is recommended to reboot the system to ensure all changes are applied.")
     print("Run 'sudo reboot' to reboot the system.")
 
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        print("success")
+    except:
+        print("Error: Could not run xd_limit.py. Please start it manually and check.")
