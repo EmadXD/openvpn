@@ -281,19 +281,28 @@ function installQuestions() {
 		read -rp "IP address: " -e -i "$IP" IP
 	fi
 	# If $IP is a private IP address, the server must be behind NAT
-	if echo "$IP" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
-		echo ""
-		echo "It seems this server is behind NAT. What is its public IPv4 address or hostname?"
-		echo "We need it for the clients to connect to the server."
+#	if echo "$IP" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
+#		echo ""
+#		echo "It seems this server is behind NAT. What is its public IPv4 address or hostname?"
+#		echo "We need it for the clients to connect to the server."
+#
+#		if [[ -z $ENDPOINT ]]; then
+#			DEFAULT_ENDPOINT=$(resolvePublicIP)
+#		fi
+#
+#		until [[ $ENDPOINT != "" ]]; do
+#			read -rp "Public IPv4 address or hostname: " -e -i "$DEFAULT_ENDPOINT" ENDPOINT
+#		done
+#	fi
+  if echo "$IP" | grep -qE '^(10\.|172\.1[6789]\.|172\.2[0-9]\.|172\.3[01]\.|192\.168)'; then
+      echo ""
+      echo "It seems this server is behind NAT. Detecting public IPv4 address..."
 
-		if [[ -z $ENDPOINT ]]; then
-			DEFAULT_ENDPOINT=$(resolvePublicIP)
-		fi
+      if [[ -z $ENDPOINT ]]; then
+          ENDPOINT=$(resolvePublicIP)
+      fi
+  fi
 
-		until [[ $ENDPOINT != "" ]]; do
-			read -rp "Public IPv4 address or hostname: " -e -i "$DEFAULT_ENDPOINT" ENDPOINT
-		done
-	fi
 
 	echo ""
 	echo "Checking for IPv6 connectivity..."
