@@ -7,6 +7,7 @@ import sys
 IPSET_NAME = "proxylist"
 DOMAINS = [
     "browserleaks.com",
+    "1e100.net",
     "2mdn-cn.net",
     "2mdn.net",
     "accounts.google.com",
@@ -50,10 +51,11 @@ DOMAINS = [
     "securepubads.g.doubleclick.net",
     "support.google.com",
     "tpc.googlesyndication.com"
-]  # 👉 اینجا دامنه‌ها رو وارد کن
+]  # 👉 همه‌ی دامنه‌ها و زیردامنه‌ها شامل می‌شوند
 VPN_SUBNET = "10.8.0.0/20"
 REDSOCKS_PORT = 12345
-PROXY_TABLE = "100"  # شماره routing table برای پروکسی
+PROXY_TABLE = "100"
+DNSMASQ_CONF = "/etc/dnsmasq.d/proxylist.conf"
 
 # 🔹 سوییچ‌ها
 FORCE_UDP_PROXY = True  # اگر True باشد: کل UDP از پروکسی رد می‌شود
@@ -79,19 +81,28 @@ def setup_ipset():
     run_cmd(f"ipset create {IPSET_NAME} hash:ip || true")
 
 
+def configure_dnsmasq():
+    """نوشتن wildcard دامنه‌ها در dnsmasq"""
+    print(f"[+] Writing dnsmasq config: {DNSMASQ_CONF}")
+    with open(DNSMASQ_CONF, "w") as f:
+        for domain in DOMAINS:
+            # همه زیردامنه‌ها + خود دامنه
+            f.write(f"ipset=/.{domain}/{IPSET_NAME}\n")
+            f.write(f"ipset=/{domain}/{IPSET_NAME}\n")
+    run_cmd("systemctl restart dnsmasq")
+
+
 def update_ipset():
-    """آی‌پی‌های دامنه‌ها را resolve و داخل ipset قرار دهد"""
+    """resolve دستی دامنه‌ها (برای گرفتن IP مستقیم)"""
     for domain in DOMAINS:
         print(f"[+] Resolving IPs for {domain}...")
         try:
             result = subprocess.run(f"dig +short {domain}", shell=True, check=True, capture_output=True, text=True)
             ips = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            if not ips:
-                print(f"[!] هیچ IP برای {domain} پیدا نشد.")
-                continue
             for ip in ips:
                 run_cmd(f"ipset add {IPSET_NAME} {ip} -exist")
-            print(f"[+] {len(ips)} IPs added for {domain}: {ips}")
+            if ips:
+                print(f"[+] Added {len(ips)} IPs for {domain}: {ips}")
         except Exception as e:
             print(f"[!] Error resolving {domain}: {e}")
 
@@ -100,14 +111,14 @@ def setup_iptables_fwmark():
     """اضافه کردن mark به ترافیک VPN برای دامنه‌ها"""
     run_cmd("iptables -t mangle -F PREROUTING")
     if TCP_DOMAINS_ONLY:
-        run_cmd(
-            f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+        run_cmd(f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} "
+                f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
 
 
 def setup_routing_table():
     """اضافه کردن routing table برای ترافیک mark شده"""
-    run_cmd(
-        f"grep -q '^{PROXY_TABLE} redsocks' /etc/iproute2/rt_tables || echo '{PROXY_TABLE} redsocks' >> /etc/iproute2/rt_tables")
+    run_cmd(f"grep -q '^{PROXY_TABLE} redsocks' /etc/iproute2/rt_tables "
+            f"|| echo '{PROXY_TABLE} redsocks' >> /etc/iproute2/rt_tables")
     run_cmd(f"ip rule del fwmark 1 table redsocks || true")
     run_cmd(f"ip route flush table redsocks || true")
     if TCP_DOMAINS_ONLY:
@@ -120,10 +131,12 @@ def setup_iptables_redirect():
     run_cmd("iptables -t nat -F PREROUTING")
 
     if TCP_DOMAINS_ONLY:
-        run_cmd(f"iptables -t nat -A PREROUTING -m mark --mark 1 -p tcp -j REDIRECT --to-ports {REDSOCKS_PORT}")
+        run_cmd(f"iptables -t nat -A PREROUTING -m mark --mark 1 -p tcp "
+                f"-j REDIRECT --to-ports {REDSOCKS_PORT}")
 
     if FORCE_UDP_PROXY:
-        run_cmd(f"iptables -t nat -A PREROUTING -i tun0 -p udp ! --dport 53 -j REDIRECT --to-ports {REDSOCKS_PORT}")
+        run_cmd(f"iptables -t nat -A PREROUTING -i tun0 -p udp ! --dport 53 "
+                f"-j REDIRECT --to-ports {REDSOCKS_PORT}")
 
 
 def main():
@@ -132,6 +145,7 @@ def main():
         sys.exit(1)
 
     setup_ipset()
+    configure_dnsmasq()
     update_ipset()
     setup_iptables_fwmark()
     setup_routing_table()
@@ -139,8 +153,8 @@ def main():
 
     print("\n✅ آماده شد!")
     print("تنظیمات فعلی:")
-    print(f"  FORCE_UDP_PROXY = {FORCE_UDP_PROXY}  (کل UDP از پروکسی رد می‌شود)")
-    print(f"  TCP_DOMAINS_ONLY = {TCP_DOMAINS_ONLY}  (TCP فقط برای دامنه‌های لیست‌شده از پروکسی رد می‌شود)")
+    print(f"  FORCE_UDP_PROXY = {FORCE_UDP_PROXY}")
+    print(f"  TCP_DOMAINS_ONLY = {TCP_DOMAINS_ONLY}")
     print("برای تست:")
     for domain in DOMAINS:
         print(f"  dig {domain}")
