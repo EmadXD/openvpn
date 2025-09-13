@@ -2,9 +2,8 @@
 import os
 import subprocess
 import sys
-import socket
-import dns.resolver
 
+os.system("pip install dnspython")
 # 🔹 تنظیمات
 IPSET_NAME = "proxylist"
 DOMAINS = [
@@ -94,6 +93,7 @@ def configure_dnsmasq():
 
 
 def update_ipset():
+    import dns.resolver
     """resolve دستی دامنه‌ها و زیردامنه‌ها برای گرفتن IP"""
     resolver = dns.resolver.Resolver()
     resolver.timeout = 5
