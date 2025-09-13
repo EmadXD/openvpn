@@ -112,18 +112,22 @@ def configure_dnsmasq_for_vpn():
                 f.write(line)
     print("[+] dnsmasq configured for tun0 and upstream DNS.")
 
-# تنظیم OpenVPN برای push DNS به کلاینت‌ها
+# تنظیم OpenVPN برای push DNS به کلاینت‌ها (حذف push قبلی)
 def configure_openvpn_dns():
     openvpn_conf = "/etc/openvpn/server.conf"  # اگر مسیر فرق داره، تغییر بده
     print("[+] Configuring OpenVPN to push DNS...")
     push_line = f'push "dhcp-option DNS {VPN_DNS_IP}"\n'
     if os.path.exists(openvpn_conf):
+        # خواندن فایل و حذف هرگونه push dhcp-option DNS قبلی
         with open(openvpn_conf, "r") as f:
-            content = f.read()
-        if push_line.strip() not in content:
-            with open(openvpn_conf, "a") as f:
-                f.write(push_line)
-        print("[+] OpenVPN DNS push configured.")
+            lines = f.readlines()
+        new_lines = [line for line in lines if not line.strip().startswith('push "dhcp-option DNS')]
+        # اضافه کردن push جدید
+        new_lines.append(push_line)
+        # بازنویسی فایل
+        with open(openvpn_conf, "w") as f:
+            f.writelines(new_lines)
+        print("[+] OpenVPN DNS push configured (previous push removed).")
         run_command(["sudo", "systemctl", "restart", "openvpn@server"], "Error restarting OpenVPN")
     else:
         print(f"[!] OpenVPN config file {openvpn_conf} not found. Please add 'push \"dhcp-option DNS {VPN_DNS_IP}\"' manually.")
