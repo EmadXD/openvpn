@@ -1,15 +1,12 @@
 import subprocess
 import sys
-import pkg_resources
 import os
+import time
 
 # نصب خودکار dnspython اگر نصب نباشد
-required = {'dnspython'}
-installed = {pkg.key for pkg in pkg_resources.working_set}
-missing = required - installed
-if missing:
-    print("[+] Installing required package: dnspython")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "dnspython"])
+os.system("sudo pip install dnspython")
+os.system("sudo pip3 install dnspython")
+time.sleep(5)
 
 # دامنه‌ها برای پروکسی (لیست نمونه، می‌تونی تغییر بدی)
 DOMAINS = [
