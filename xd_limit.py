@@ -1,6 +1,7 @@
 import subprocess
 import os
 import sys
+import time
 
 
 def run_command(command, check=True):
@@ -68,8 +69,7 @@ ubuntu hard nofile 1048576
     override_content = """
 [Service]
 LimitNOFILE=1048576
-LimitNOFILESoft=1048576
-"""
+"""  # LimitNOFILESoft=1048576
     with open('/etc/systemd/system/redsocks.service.d/override.conf', 'w') as f:
         f.write(override_content)
 
@@ -99,6 +99,8 @@ LimitNOFILESoft=1048576
 if __name__ == "__main__":
     try:
         main()
+        print("success")
+        time.sleep(460000)
         print("success")
     except:
         print("Error: Could not run xd_limit.py. Please start it manually and check.")
