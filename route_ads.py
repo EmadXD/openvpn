@@ -1,20 +1,13 @@
 #!/usr/bin/env python3
+import os
 import subprocess
 import sys
-import os
-import time
+import socket
+import dns.resolver
 
-# نصب خودکار dnspython اگر نصب نباشد
-print("[+] Installing required packages...")
-os.system("sudo pip install dnspython")
-os.system("sudo pip3 install dnspython")
-os.system("sudo apt-get update")
-os.system("sudo apt-get install -y dnsmasq ipset")
-time.sleep(5)
-
-# دامنه‌ها برای پروکسی (لیست نمونه، می‌تونی تغییر بدی)
+# 🔹 تنظیمات
+IPSET_NAME = "proxylist"
 DOMAINS = [
-    "aparatvpn.com",
     "browserleaks.com",
     "1e100.net",
     "2mdn-cn.net",
@@ -59,126 +52,118 @@ DOMAINS = [
     "pubads.g.doubleclick.net",
     "securepubads.g.doubleclick.net",
     "support.google.com",
-    "tpc.googlesyndication.com",
+    "tpc.googlesyndication.com"
 ]
+VPN_SUBNET = "10.8.0.0/20"
+REDSOCKS_PORT = 12345
+PROXY_TABLE = "100"
+DNSMASQ_CONF = "/etc/dnsmasq.d/proxylist.conf"
 
-# تنظیمات
+# 🔹 سوییچ‌ها
 FORCE_UDP_PROXY = True
 TCP_DOMAINS_ONLY = True
-SUBDOMAINS = ["www", "api", "ads", "mail", "app", "static", "cdn"]
 
-
-# غیرفعال کردن systemd-resolved و تنظیم resolv.conf
-def disable_systemd_resolved():
-    print("[+] Disabling systemd-resolved...")
+def run_cmd(cmd):
+    """اجرای دستور و نمایش خروجی"""
+    print(f"[+] Running: {cmd}")
     try:
-        subprocess.run(["sudo", "systemctl", "stop", "systemd-resolved"], check=True)
-        subprocess.run(["sudo", "systemctl", "disable", "systemd-resolved"], check=True)
-        print("[+] systemd-resolved disabled.")
+        result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout.strip())
     except subprocess.CalledProcessError as e:
-        print(f"[!] Error disabling systemd-resolved: {e}")
-
-    # حذف symlink و ایجاد resolv.conf جدید
-    resolv_conf = "/etc/resolv.conf"
-    if os.path.islink(resolv_conf) or os.path.exists(resolv_conf):
-        print("[+] Removing existing /etc/resolv.conf...")
-        subprocess.run(["sudo", "chattr", "-i", "/etc/resolv.conf"], check=True)
-        subprocess.run(["sudo", "rm", "-f", resolv_conf], check=True)
-
-    print("[+] Creating new /etc/resolv.conf with Google DNS...")
-    with open(resolv_conf, "w") as f:
-        f.write("nameserver 8.8.8.8\n")
-        f.write("nameserver 8.8.4.4\n")
-    subprocess.run(["sudo", "chattr", "+i", resolv_conf], check=True)  # قفل کردن فایل
-    print("[+] /etc/resolv.conf configured.")
-
-
-# تابع برای اجرای دستورات و چاپ خروجی
-def run_command(cmd, error_message="Error running command"):
-    print(f"[+] Running: {' '.join(cmd)}")
-    try:
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except subprocess.CalledProcessError as e:
-        print(f"[!] {error_message}: {' '.join(cmd)}")
+        print(f"[!] Error running command: {cmd}")
         if e.stderr:
-            print(e.stderr)
+            print(e.stderr.strip())
 
+def setup_ipset():
+    """ساخت یا پاک کردن ipset"""
+    run_cmd(f"ipset destroy {IPSET_NAME} || true")
+    run_cmd(f"ipset create {IPSET_NAME} hash:ip || true")
 
-# تابع برای resolve کردن IPهای دامنه
-def update_ipset(domain, ipset_name="proxylist"):
-    import dns.resolver
-    resolver = dns.resolver.Resolver()
-    resolver.nameservers = ['8.8.8.8', '8.8.4.4']  # استفاده از Google DNS
-    resolver.timeout = 10
-    resolver.lifetime = 10
-    ips = []
-
-    try:
-        answers = resolver.resolve(domain, 'A')
-        for rdata in answers:
-            ip = rdata.address
-            run_command(["sudo", "ipset", "add", ipset_name, ip, "-exist"])
-            ips.append(ip)
-        print(f"[+] Added {len(ips)} IPs for {domain}: {ips}")
-    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
-        print(f"[!] Domain {domain} not found")
-    return ips
-
-
-# تابع اصلی
-def main():
-    # غیرفعال کردن systemd-resolved
-    disable_systemd_resolved()
-
-    # آماده‌سازی ipset
-    run_command(["sudo", "ipset", "destroy", "proxylist"], "Error destroying ipset")
-    run_command(["sudo", "ipset", "create", "proxylist", "hash:ip"], "Error creating ipset")
-
-    # نوشتن تنظیمات dnsmasq
-    dnsmasq_conf = "/etc/dnsmasq.d/proxylist.conf"
-    print(f"[+] Writing dnsmasq config: {dnsmasq_conf}")
-    with open(dnsmasq_conf, "w") as f:
+def configure_dnsmasq():
+    """نوشتن wildcard دامنه‌ها در dnsmasq برای پشتیبانی از زیردامنه‌های متغیر"""
+    print(f"[+] Writing dnsmasq config: {DNSMASQ_CONF}")
+    with open(DNSMASQ_CONF, "w") as f:
         for domain in DOMAINS:
-            f.write(f"ipset=/.{domain}/proxylist\n")
-    run_command(["sudo", "chmod", "644", dnsmasq_conf])  # تنظیم permissions
+            # تنظیم dnsmasq برای هدایت تمام زیردامنه‌ها به ipset
+            f.write(f"ipset=/.{domain}/{IPSET_NAME}\n")
+    run_cmd("systemctl restart dnsmasq")
 
-    # ری‌استارت dnsmasq
-    run_command(["sudo", "systemctl", "restart", "dnsmasq"], "Error restarting dnsmasq")
-    run_command(["sudo", "systemctl", "status", "dnsmasq"], "Error checking dnsmasq status")
+def update_ipset():
+    """resolve دستی دامنه‌ها و زیردامنه‌ها برای گرفتن IP"""
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = 5
+    resolver.lifetime = 5
 
-    # Resolve کردن دامنه‌ها و زیردامنه‌ها
     for domain in DOMAINS:
         print(f"[+] Resolving IPs for {domain} and its subdomains...")
-        update_ipset(domain)
-        for subdomain in SUBDOMAINS:
-            full_domain = f"{subdomain}.{domain}"
-            update_ipset(full_domain)
+        try:
+            # Resolve دامنه اصلی
+            answers = resolver.resolve(domain, 'A')
+            ips = [str(rdata) for rdata in answers]
+            for ip in ips:
+                run_cmd(f"ipset add {IPSET_NAME} {ip} -exist")
+            if ips:
+                print(f"[+] Added {len(ips)} IPs for {domain}: {ips}")
 
-    # تنظیمات iptables
-    run_command(["sudo", "iptables", "-t", "mangle", "-F", "PREROUTING"])
-    run_command(
-        ["sudo", "iptables", "-t", "mangle", "-A", "PREROUTING", "-s", "10.8.0.0/20", "-m", "set", "--match-set",
-         "proxylist",
-         "dst", "-j", "MARK", "--set-mark", "1"])
+            # تلاش برای پیدا کردن زیردامنه‌های متداول
+            common_subdomains = ['www', 'api', 'ads', 'mail', 'app', 'static', 'cdn']
+            for subdomain in common_subdomains:
+                try:
+                    sub_domain = f"{subdomain}.{domain}"
+                    answers = resolver.resolve(sub_domain, 'A')
+                    sub_ips = [str(rdata) for rdata in answers]
+                    for ip in sub_ips:
+                        run_cmd(f"ipset add {IPSET_NAME} {ip} -exist")
+                    if sub_ips:
+                        print(f"[+] Added {len(sub_ips)} IPs for {sub_domain}: {sub_ips}")
+                except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+                    print(f"[!] Subdomain {sub_domain} not found")
+                except Exception as e:
+                    print(f"[!] Error resolving {sub_domain}: {e}")
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            print(f"[!] Domain {domain} not found")
+        except Exception as e:
+            print(f"[!] Error resolving {domain}: {e}")
 
-    # تنظیمات ip route
-    run_command(["sudo", "grep", "-q", "^100 redsocks", "/etc/iproute2/rt_tables"], "Error checking rt_tables")
-    run_command(["sudo", "sh", "-c", "echo '100 redsocks' >> /etc/iproute2/rt_tables"])
-    run_command(["sudo", "ip", "rule", "del", "fwmark", "1", "table", "redsocks"], "Error deleting ip rule")
-    run_command(["sudo", "ip", "route", "flush", "table", "redsocks"], "Error flushing ip route")
-    run_command(["sudo", "ip", "rule", "add", "fwmark", "1", "table", "redsocks"])
-    run_command(["sudo", "ip", "route", "add", "default", "via", "127.0.0.1", "dev", "lo", "table", "redsocks"])
+def setup_iptables_fwmark():
+    """اضافه کردن mark به ترافیک VPN برای دامنه‌ها"""
+    run_cmd("iptables -t mangle -F PREROUTING")
+    if TCP_DOMAINS_ONLY:
+        run_cmd(f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} "
+                f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
 
-    # تنظیمات NAT برای TCP و UDP
-    run_command(["sudo", "iptables", "-t", "nat", "-F", "PREROUTING"])
-    run_command(
-        ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j",
-         "REDIRECT",
-         "--to-ports", "12345"])
+def setup_routing_table():
+    """اضافه کردن routing table برای ترافیک mark شده"""
+    run_cmd(f"grep -q '^{PROXY_TABLE} redsocks' /etc/iproute2/rt_tables "
+            f"|| echo '{PROXY_TABLE} redsocks' >> /etc/iproute2/rt_tables")
+    run_cmd(f"ip rule del fwmark 1 table redsocks || true")
+    run_cmd(f"ip route flush table redsocks || true")
+    if TCP_DOMAINS_ONLY:
+        run_cmd(f"ip rule add fwmark 1 table redsocks")
+        run_cmd(f"ip route add default via 127.0.0.1 dev lo table redsocks")
+
+def setup_iptables_redirect():
+    """REDIRECT به پروکسی بسته به تنظیمات"""
+    run_cmd("iptables -t nat -F PREROUTING")
+    if TCP_DOMAINS_ONLY:
+        run_cmd(f"iptables -t nat -A PREROUTING -m mark --mark 1 -p tcp "
+                f"-j REDIRECT --to-ports {REDSOCKS_PORT}")
     if FORCE_UDP_PROXY:
-        run_command(
-            ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-i", "tun0", "-p", "udp", "!", "--dport", "53", "-j",
-             "REDIRECT", "--to-ports", "12345"])
+        run_cmd(f"iptables -t nat -A PREROUTING -i tun0 -p udp ! --dport 53 "
+                f"-j REDIRECT --to-ports {REDSOCKS_PORT}")
+
+def main():
+    if os.geteuid() != 0:
+        print("[!] لطفاً اسکریپت را با sudo اجرا کنید")
+        sys.exit(1)
+
+    setup_ipset()
+    configure_dnsmasq()
+    update_ipset()
+    setup_iptables_fwmark()
+    setup_routing_table()
+    setup_iptables_redirect()
 
     print("\n✅ آماده شد!")
     print("تنظیمات فعلی:")
@@ -189,9 +174,5 @@ def main():
         print(f"  dig {domain}")
     print("  sudo ipset list proxylist")
 
-
 if __name__ == "__main__":
-    if os.geteuid() != 0:
-        print("[!] This script must be run as root (sudo).")
-        sys.exit(1)
     main()
