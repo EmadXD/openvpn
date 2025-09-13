@@ -5,60 +5,20 @@ import sys
 
 # 🔹 تنظیمات
 IPSET_NAME = "proxylist"
-DNSMASQ_CONF = "/etc/dnsmasq.d/proxylist.conf"
+DNSMASQ_CONF = "/etc/dnsmasq.conf"
 VPN_SUBNET = "10.8.0.0/20"
 REDSOCKS_PORT = 12345
 
 DOMAINS = [
-    "browserleaks.com",
+    "ipinfo.io",
     "1e100.net",
-    "2mdn-cn.net",
-    "2mdn.net",
-    "accounts.google.com",
-    "ad.doubleclick.net",
-    "admob-api.google.com",
-    "admob-cn.com",
+    "browserleaks.com",
     "admob.com",
-    "admob.google.com",
-    "admob.googleapis.com",
-    "ads.youtube.com",
-    "adservice.google.com",
-    "adservices.google.com",
-    "analytics.google.com",
-    "app-measurement-cn.com",
-    "app-measurement.com",
-    "apps.admob.com",
-    "clients.google.com",
-    "developers.google.com",
-    "doubleclick-cn.net",
-    "doubleclick.net",
-    "firebasedynamiclinks.googleapis.com",
-    "firebase.google.com",
-    "firebaseinstallations.googleapis.com",
-    "firebaseremoteconfig.googleapis.com",
-    "g.doubleclick.net",
-    "google-analytics-cn.com",
-    "google-analytics.com",
-    "google.com",
-    "googleadservices.com",
-    "googleads.g.doubleclick.net",
-    "googleapis.com",
-    "googlesyndication.com",
-    "googletagmanager.com",
-    "googletagservices.com",
-    "gstatic.com",
-    "pagead.l.doubleclick.net",
-    "pagead2.googlesyndication.com",
-    "play.google.com",
-    "play.googleapis.com",
-    "pubads.g.doubleclick.net",
-    "securepubads.g.doubleclick.net",
-    "support.google.com",
-    "tpc.googlesyndication.com"
+    "google.com"
 ]
 
-FORCE_UDP_PROXY = True
-TCP_DOMAINS_ONLY = True
+FORCE_UDP_PROXY = True  # کل UDP از VPN به پروکسی
+TCP_DOMAINS_ONLY = True  # TCP فقط برای دامنه‌های لیست شده
 
 
 def run_cmd(cmd, ignore_error=False):
@@ -81,20 +41,22 @@ def install_packages():
 
 
 def setup_dnsmasq():
-    """تنظیم dnsmasq روی پورت 5353 و اضافه کردن ipset rules"""
-    lines = [
-        "port=5353",
-        "listen-address=127.0.0.1",
-        "bind-interfaces"
-    ]
-
+    """ویرایش /etc/dnsmasq.conf و اضافه کردن rules"""
+    lines = []
+    # پورت امن و bind
+    lines.append("port=5353")
+    lines.append("listen-address=127.0.0.1")
+    lines.append("bind-interfaces")
+    
+    # ipset rules برای تمام دامنه‌ها و زیردامنه‌ها
     for domain in DOMAINS:
-        lines.append(f"ipset=/{domain}/{IPSET_NAME}")
+        lines.append(f"ipset=/.{domain}/{IPSET_NAME}")
 
-    os.makedirs("/etc/dnsmasq.d", exist_ok=True)
+    # نوشتن فایل
     with open(DNSMASQ_CONF, "w") as f:
         f.write("\n".join(lines) + "\n")
 
+    # ریستارت dnsmasq
     run_cmd("systemctl restart dnsmasq")
 
 
@@ -129,7 +91,10 @@ def main():
     setup_iptables()
 
     print("\n✅ آماده شد!")
-    print("برای تست:")
+    print("تنظیمات فعلی:")
+    print(f"  FORCE_UDP_PROXY = {FORCE_UDP_PROXY}  (کل UDP از VPN به پروکسی رد می‌شود)")
+    print(f"  TCP_DOMAINS_ONLY = {TCP_DOMAINS_ONLY}  (TCP فقط برای دامنه‌های لیست‌شده از پروکسی رد می‌شود)")
+    print("\nبرای تست:")
     for domain in DOMAINS:
         print(f"  dig @{ '127.0.0.1' } -p 5353 {domain}")
     print("  sudo ipset list proxylist")
