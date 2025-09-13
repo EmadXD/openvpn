@@ -5,6 +5,10 @@ import sys
 
 # 🔹 تنظیمات
 IPSET_NAME = "proxylist"
+DNSMASQ_CONF = "/etc/dnsmasq.d/proxylist.conf"
+VPN_SUBNET = "10.8.0.0/20"
+REDSOCKS_PORT = 12345
+
 DOMAINS = [
     "browserleaks.com",
     "1e100.net",
@@ -51,86 +55,61 @@ DOMAINS = [
     "securepubads.g.doubleclick.net",
     "support.google.com",
     "tpc.googlesyndication.com"
-]  # 👉 همه‌ی دامنه‌ها و زیردامنه‌ها شامل می‌شوند
-VPN_SUBNET = "10.8.0.0/20"
-REDSOCKS_PORT = 12345
-PROXY_TABLE = "100"
-DNSMASQ_CONF = "/etc/dnsmasq.d/proxylist.conf"
+]
 
-# 🔹 سوییچ‌ها
-FORCE_UDP_PROXY = True  # اگر True باشد: کل UDP از پروکسی رد می‌شود
-TCP_DOMAINS_ONLY = True  # اگر True باشد: فقط TCP دامنه‌های لیست‌شده از پروکسی رد می‌شوند
+FORCE_UDP_PROXY = True
+TCP_DOMAINS_ONLY = True
 
 
-def run_cmd(cmd):
-    """اجرای دستور و نمایش خروجی"""
+def run_cmd(cmd, ignore_error=False):
     print(f"[+] Running: {cmd}")
     try:
         result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
-        if result.stdout:
+        if result.stdout.strip():
             print(result.stdout.strip())
+        return result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        print(f"[!] Error running command: {cmd}")
-        if e.stderr:
-            print(e.stderr.strip())
+        if not ignore_error:
+            print(f"[!] Error: {e.stderr.strip()}")
+        return None
 
 
-def setup_ipset():
-    """ساخت یا پاک کردن ipset"""
-    run_cmd(f"ipset destroy {IPSET_NAME} || true")
-    run_cmd(f"ipset create {IPSET_NAME} hash:ip || true")
+def install_packages():
+    pkgs = ["iptables", "ipset", "dnsutils", "dnsmasq"]
+    run_cmd("apt-get update -y", ignore_error=True)
+    run_cmd("apt-get install -y " + " ".join(pkgs))
 
 
-def configure_dnsmasq():
-    """نوشتن wildcard دامنه‌ها در dnsmasq"""
-    print(f"[+] Writing dnsmasq config: {DNSMASQ_CONF}")
+def setup_dnsmasq():
+    """تنظیم dnsmasq روی پورت 5353 و اضافه کردن ipset rules"""
+    lines = [
+        "port=5353",
+        "listen-address=127.0.0.1",
+        "bind-interfaces"
+    ]
+
+    for domain in DOMAINS:
+        lines.append(f"ipset=/{domain}/{IPSET_NAME}")
+
+    os.makedirs("/etc/dnsmasq.d", exist_ok=True)
     with open(DNSMASQ_CONF, "w") as f:
-        for domain in DOMAINS:
-            # همه زیردامنه‌ها + خود دامنه
-            f.write(f"ipset=/.{domain}/{IPSET_NAME}\n")
-            f.write(f"ipset=/{domain}/{IPSET_NAME}\n")
+        f.write("\n".join(lines) + "\n")
+
     run_cmd("systemctl restart dnsmasq")
 
 
-def update_ipset():
-    """resolve دستی دامنه‌ها (برای گرفتن IP مستقیم)"""
-    for domain in DOMAINS:
-        print(f"[+] Resolving IPs for {domain}...")
-        try:
-            result = subprocess.run(f"dig +short {domain}", shell=True, check=True, capture_output=True, text=True)
-            ips = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            for ip in ips:
-                run_cmd(f"ipset add {IPSET_NAME} {ip} -exist")
-            if ips:
-                print(f"[+] Added {len(ips)} IPs for {domain}: {ips}")
-        except Exception as e:
-            print(f"[!] Error resolving {domain}: {e}")
+def setup_ipset():
+    run_cmd(f"ipset destroy {IPSET_NAME} || true", ignore_error=True)
+    run_cmd(f"ipset create {IPSET_NAME} hash:ip")
 
 
-def setup_iptables_fwmark():
-    """اضافه کردن mark به ترافیک VPN برای دامنه‌ها"""
+def setup_iptables():
     run_cmd("iptables -t mangle -F PREROUTING")
-    if TCP_DOMAINS_ONLY:
-        run_cmd(f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} "
-                f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
-
-
-def setup_routing_table():
-    """اضافه کردن routing table برای ترافیک mark شده"""
-    run_cmd(f"grep -q '^{PROXY_TABLE} redsocks' /etc/iproute2/rt_tables "
-            f"|| echo '{PROXY_TABLE} redsocks' >> /etc/iproute2/rt_tables")
-    run_cmd(f"ip rule del fwmark 1 table redsocks || true")
-    run_cmd(f"ip route flush table redsocks || true")
-    if TCP_DOMAINS_ONLY:
-        run_cmd(f"ip rule add fwmark 1 table redsocks")
-        run_cmd(f"ip route add default via 127.0.0.1 dev lo table redsocks")
-
-
-def setup_iptables_redirect():
-    """REDIRECT به پروکسی بسته به تنظیمات"""
     run_cmd("iptables -t nat -F PREROUTING")
 
     if TCP_DOMAINS_ONLY:
+        run_cmd(f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} "
+                f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
         run_cmd(f"iptables -t nat -A PREROUTING -m mark --mark 1 -p tcp "
                 f"-j REDIRECT --to-ports {REDSOCKS_PORT}")
 
@@ -144,20 +123,15 @@ def main():
         print("[!] لطفاً اسکریپت را با sudo اجرا کنید")
         sys.exit(1)
 
+    install_packages()
     setup_ipset()
-    configure_dnsmasq()
-    update_ipset()
-    setup_iptables_fwmark()
-    setup_routing_table()
-    setup_iptables_redirect()
+    setup_dnsmasq()
+    setup_iptables()
 
     print("\n✅ آماده شد!")
-    print("تنظیمات فعلی:")
-    print(f"  FORCE_UDP_PROXY = {FORCE_UDP_PROXY}")
-    print(f"  TCP_DOMAINS_ONLY = {TCP_DOMAINS_ONLY}")
     print("برای تست:")
     for domain in DOMAINS:
-        print(f"  dig {domain}")
+        print(f"  dig @{ '127.0.0.1' } -p 5353 {domain}")
     print("  sudo ipset list proxylist")
 
 
