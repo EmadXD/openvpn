@@ -1,5 +1,4 @@
 import subprocess
-import dns.resolver
 import sys
 import pkg_resources
 import os
@@ -67,6 +66,7 @@ FORCE_UDP_PROXY = True
 TCP_DOMAINS_ONLY = True
 SUBDOMAINS = ["www", "api", "ads", "mail", "app", "static", "cdn"]
 
+
 # غیرفعال کردن systemd-resolved و تنظیم resolv.conf
 def disable_systemd_resolved():
     print("[+] Disabling systemd-resolved...")
@@ -90,6 +90,7 @@ def disable_systemd_resolved():
     subprocess.run(["chattr", "+i", resolv_conf], check=True)  # قفل کردن فایل
     print("[+] /etc/resolv.conf configured.")
 
+
 # تابع برای اجرای دستورات و چاپ خروجی
 def run_command(cmd, error_message="Error running command"):
     print(f"[+] Running: {' '.join(cmd)}")
@@ -99,14 +100,16 @@ def run_command(cmd, error_message="Error running command"):
         print(f"[!] {error_message}: {' '.join(cmd)}")
         print(e.stderr)
 
+
 # تابع برای resolve کردن IPهای دامنه
 def update_ipset(domain, ipset_name="proxylist"):
+    import dns.resolver
     resolver = dns.resolver.Resolver()
     resolver.nameservers = ['8.8.8.8', '8.8.4.4']  # استفاده از Google DNS
     resolver.timeout = 10
     resolver.lifetime = 10
     ips = []
-    
+
     try:
         answers = resolver.resolve(domain, 'A')
         for rdata in answers:
@@ -117,6 +120,7 @@ def update_ipset(domain, ipset_name="proxylist"):
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
         print(f"[!] Domain {domain} not found")
     return ips
+
 
 # تابع اصلی
 def main():
@@ -148,8 +152,10 @@ def main():
 
     # تنظیمات iptables
     run_command(["iptables", "-t", "mangle", "-F", "PREROUTING"])
-    run_command(["iptables", "-t", "mangle", "-A", "PREROUTING", "-s", "10.8.0.0/20", "-m", "set", "--match-set", "proxylist", "dst", "-j", "MARK", "--set-mark", "1"])
-    
+    run_command(
+        ["iptables", "-t", "mangle", "-A", "PREROUTING", "-s", "10.8.0.0/20", "-m", "set", "--match-set", "proxylist",
+         "dst", "-j", "MARK", "--set-mark", "1"])
+
     # تنظیمات ip route
     run_command(["grep", "-q", "^100 redsocks", "/etc/iproute2/rt_tables"], "Error checking rt_tables")
     run_command(["sh", "-c", "echo '100 redsocks' >> /etc/iproute2/rt_tables"])
@@ -157,12 +163,15 @@ def main():
     run_command(["ip", "route", "flush", "table", "redsocks"], "Error flushing ip route")
     run_command(["ip", "rule", "add", "fwmark", "1", "table", "redsocks"])
     run_command(["ip", "route", "add", "default", "via", "127.0.0.1", "dev", "lo", "table", "redsocks"])
-    
+
     # تنظیمات NAT برای TCP و UDP
     run_command(["iptables", "-t", "nat", "-F", "PREROUTING"])
-    run_command(["iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j", "REDIRECT", "--to-ports", "12345"])
+    run_command(
+        ["iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j", "REDIRECT",
+         "--to-ports", "12345"])
     if FORCE_UDP_PROXY:
-        run_command(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", "tun0", "-p", "udp", "!", "--dport", "53", "-j", "REDIRECT", "--to-ports", "12345"])
+        run_command(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", "tun0", "-p", "udp", "!", "--dport", "53", "-j",
+                     "REDIRECT", "--to-ports", "12345"])
 
     print("\n✅ آماده شد!")
     print("تنظیمات فعلی:")
@@ -172,6 +181,7 @@ def main():
     for domain in DOMAINS:
         print(f"  dig {domain}")
     print("  sudo ipset list proxylist")
+
 
 if __name__ == "__main__":
     if os.geteuid() != 0:
