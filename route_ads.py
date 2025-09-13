@@ -1,104 +1,180 @@
-#!/usr/bin/env python3
-import os
 import subprocess
+import dns.resolver
 import sys
+import pkg_resources
+import os
 
-# 🔹 تنظیمات
-IPSET_NAME = "proxylist"
-DNSMASQ_CONF = "/etc/dnsmasq.conf"
-VPN_SUBNET = "10.8.0.0/20"
-REDSOCKS_PORT = 12345
+# نصب خودکار dnspython اگر نصب نباشد
+required = {'dnspython'}
+installed = {pkg.key for pkg in pkg_resources.working_set}
+missing = required - installed
+if missing:
+    print("[+] Installing required package: dnspython")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "dnspython"])
 
+# دامنه‌ها برای پروکسی (لیست نمونه، می‌تونی تغییر بدی)
 DOMAINS = [
-    "ipinfo.io",
-    "1e100.net",
+    "aparatvpn.com",
     "browserleaks.com",
+    "1e100.net",
+    "2mdn-cn.net",
+    "2mdn.net",
+    "accounts.google.com",
+    "ad.doubleclick.net",
+    "admob-api.google.com",
+    "admob-cn.com",
     "admob.com",
-    "google.com"
+    "admob.google.com",
+    "admob.googleapis.com",
+    "ads.youtube.com",
+    "adservice.google.com",
+    "adservices.google.com",
+    "analytics.google.com",
+    "app-measurement-cn.com",
+    "app-measurement.com",
+    "apps.admob.com",
+    "clients.google.com",
+    "developers.google.com",
+    "doubleclick-cn.net",
+    "doubleclick.net",
+    "firebasedynamiclinks.googleapis.com",
+    "firebase.google.com",
+    "firebaseinstallations.googleapis.com",
+    "firebaseremoteconfig.googleapis.com",
+    "g.doubleclick.net",
+    "google-analytics-cn.com",
+    "google-analytics.com",
+    "google.com",
+    "googleadservices.com",
+    "googleads.g.doubleclick.net",
+    "googleapis.com",
+    "googlesyndication.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    "gstatic.com",
+    "pagead.l.doubleclick.net",
+    "pagead2.googlesyndication.com",
+    "play.google.com",
+    "play.googleapis.com",
+    "pubads.g.doubleclick.net",
+    "securepubads.g.doubleclick.net",
+    "support.google.com",
+    "tpc.googlesyndication.com",
 ]
 
-FORCE_UDP_PROXY = True  # کل UDP از VPN به پروکسی
-TCP_DOMAINS_ONLY = True  # TCP فقط برای دامنه‌های لیست شده
+# تنظیمات
+FORCE_UDP_PROXY = True
+TCP_DOMAINS_ONLY = True
+SUBDOMAINS = ["www", "api", "ads", "mail", "app", "static", "cdn"]
 
-
-def run_cmd(cmd, ignore_error=False):
-    print(f"[+] Running: {cmd}")
+# غیرفعال کردن systemd-resolved و تنظیم resolv.conf
+def disable_systemd_resolved():
+    print("[+] Disabling systemd-resolved...")
     try:
-        result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
-        if result.stdout.strip():
-            print(result.stdout.strip())
-        return result.stdout.strip()
+        subprocess.run(["systemctl", "stop", "systemd-resolved"], check=True)
+        subprocess.run(["systemctl", "disable", "systemd-resolved"], check=True)
+        print("[+] systemd-resolved disabled.")
     except subprocess.CalledProcessError as e:
-        if not ignore_error:
-            print(f"[!] Error: {e.stderr.strip()}")
-        return None
+        print(f"[!] Error disabling systemd-resolved: {e}")
 
+    # حذف symlink و ایجاد resolv.conf جدید
+    resolv_conf = "/etc/resolv.conf"
+    if os.path.islink(resolv_conf) or os.path.exists(resolv_conf):
+        print("[+] Removing existing /etc/resolv.conf...")
+        subprocess.run(["rm", "-f", resolv_conf], check=True)
 
-def install_packages():
-    pkgs = ["iptables", "ipset", "dnsutils", "dnsmasq"]
-    run_cmd("apt-get update -y", ignore_error=True)
-    run_cmd("apt-get install -y " + " ".join(pkgs))
+    print("[+] Creating new /etc/resolv.conf with Google DNS...")
+    with open(resolv_conf, "w") as f:
+        f.write("nameserver 8.8.8.8\n")
+        f.write("nameserver 8.8.4.4\n")
+    subprocess.run(["chattr", "+i", resolv_conf], check=True)  # قفل کردن فایل
+    print("[+] /etc/resolv.conf configured.")
 
+# تابع برای اجرای دستورات و چاپ خروجی
+def run_command(cmd, error_message="Error running command"):
+    print(f"[+] Running: {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[!] {error_message}: {' '.join(cmd)}")
+        print(e.stderr)
 
-def setup_dnsmasq():
-    """ویرایش /etc/dnsmasq.conf و اضافه کردن rules"""
-    lines = []
-    # پورت امن و bind
-    lines.append("port=5353")
-    lines.append("listen-address=127.0.0.1")
-    lines.append("bind-interfaces")
+# تابع برای resolve کردن IPهای دامنه
+def update_ipset(domain, ipset_name="proxylist"):
+    resolver = dns.resolver.Resolver()
+    resolver.nameservers = ['8.8.8.8', '8.8.4.4']  # استفاده از Google DNS
+    resolver.timeout = 10
+    resolver.lifetime = 10
+    ips = []
     
-    # ipset rules برای تمام دامنه‌ها و زیردامنه‌ها
-    for domain in DOMAINS:
-        lines.append(f"ipset=/.{domain}/{IPSET_NAME}")
+    try:
+        answers = resolver.resolve(domain, 'A')
+        for rdata in answers:
+            ip = rdata.address
+            run_command(["ipset", "add", ipset_name, ip, "-exist"])
+            ips.append(ip)
+        print(f"[+] Added {len(ips)} IPs for {domain}: {ips}")
+    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
+        print(f"[!] Domain {domain} not found")
+    return ips
 
-    # نوشتن فایل
-    with open(DNSMASQ_CONF, "w") as f:
-        f.write("\n".join(lines) + "\n")
-
-    # ریستارت dnsmasq
-    run_cmd("systemctl restart dnsmasq")
-
-
-def setup_ipset():
-    run_cmd(f"ipset destroy {IPSET_NAME} || true", ignore_error=True)
-    run_cmd(f"ipset create {IPSET_NAME} hash:ip")
-
-
-def setup_iptables():
-    run_cmd("iptables -t mangle -F PREROUTING")
-    run_cmd("iptables -t nat -F PREROUTING")
-
-    if TCP_DOMAINS_ONLY:
-        run_cmd(f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} "
-                f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
-        run_cmd(f"iptables -t nat -A PREROUTING -m mark --mark 1 -p tcp "
-                f"-j REDIRECT --to-ports {REDSOCKS_PORT}")
-
-    if FORCE_UDP_PROXY:
-        run_cmd(f"iptables -t nat -A PREROUTING -i tun0 -p udp ! --dport 53 "
-                f"-j REDIRECT --to-ports {REDSOCKS_PORT}")
-
-
+# تابع اصلی
 def main():
-    if os.geteuid() != 0:
-        print("[!] لطفاً اسکریپت را با sudo اجرا کنید")
-        sys.exit(1)
+    # غیرفعال کردن systemd-resolved
+    disable_systemd_resolved()
 
-    install_packages()
-    setup_ipset()
-    setup_dnsmasq()
-    setup_iptables()
+    # آماده‌سازی ipset
+    run_command(["ipset", "destroy", "proxylist"], "Error destroying ipset")
+    run_command(["ipset", "create", "proxylist", "hash:ip"], "Error creating ipset")
+
+    # نوشتن تنظیمات dnsmasq
+    dnsmasq_conf = "/etc/dnsmasq.d/proxylist.conf"
+    print(f"[+] Writing dnsmasq config: {dnsmasq_conf}")
+    with open(dnsmasq_conf, "w") as f:
+        for domain in DOMAINS:
+            f.write(f"ipset=/.{domain}/proxylist\n")
+
+    # ری‌استارت dnsmasq
+    run_command(["systemctl", "restart", "dnsmasq"], "Error restarting dnsmasq")
+    run_command(["systemctl", "status", "dnsmasq"], "Error checking dnsmasq status")
+
+    # Resolve کردن دامنه‌ها و زیردامنه‌ها
+    for domain in DOMAINS:
+        print(f"[+] Resolving IPs for {domain} and its subdomains...")
+        update_ipset(domain)
+        for subdomain in SUBDOMAINS:
+            full_domain = f"{subdomain}.{domain}"
+            update_ipset(full_domain)
+
+    # تنظیمات iptables
+    run_command(["iptables", "-t", "mangle", "-F", "PREROUTING"])
+    run_command(["iptables", "-t", "mangle", "-A", "PREROUTING", "-s", "10.8.0.0/20", "-m", "set", "--match-set", "proxylist", "dst", "-j", "MARK", "--set-mark", "1"])
+    
+    # تنظیمات ip route
+    run_command(["grep", "-q", "^100 redsocks", "/etc/iproute2/rt_tables"], "Error checking rt_tables")
+    run_command(["sh", "-c", "echo '100 redsocks' >> /etc/iproute2/rt_tables"])
+    run_command(["ip", "rule", "del", "fwmark", "1", "table", "redsocks"], "Error deleting ip rule")
+    run_command(["ip", "route", "flush", "table", "redsocks"], "Error flushing ip route")
+    run_command(["ip", "rule", "add", "fwmark", "1", "table", "redsocks"])
+    run_command(["ip", "route", "add", "default", "via", "127.0.0.1", "dev", "lo", "table", "redsocks"])
+    
+    # تنظیمات NAT برای TCP و UDP
+    run_command(["iptables", "-t", "nat", "-F", "PREROUTING"])
+    run_command(["iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j", "REDIRECT", "--to-ports", "12345"])
+    if FORCE_UDP_PROXY:
+        run_command(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", "tun0", "-p", "udp", "!", "--dport", "53", "-j", "REDIRECT", "--to-ports", "12345"])
 
     print("\n✅ آماده شد!")
     print("تنظیمات فعلی:")
-    print(f"  FORCE_UDP_PROXY = {FORCE_UDP_PROXY}  (کل UDP از VPN به پروکسی رد می‌شود)")
-    print(f"  TCP_DOMAINS_ONLY = {TCP_DOMAINS_ONLY}  (TCP فقط برای دامنه‌های لیست‌شده از پروکسی رد می‌شود)")
-    print("\nبرای تست:")
+    print(f"  FORCE_UDP_PROXY = {FORCE_UDP_PROXY}")
+    print(f"  TCP_DOMAINS_ONLY = {TCP_DOMAINS_ONLY}")
+    print("برای تست:")
     for domain in DOMAINS:
-        print(f"  dig @{ '127.0.0.1' } -p 5353 {domain}")
+        print(f"  dig {domain}")
     print("  sudo ipset list proxylist")
 
-
 if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print("[!] This script must be run as root (sudo).")
+        sys.exit(1)
     main()
