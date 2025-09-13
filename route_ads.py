@@ -6,6 +6,7 @@ import time
 # نصب خودکار dnspython اگر نصب نباشد
 os.system("sudo pip install dnspython")
 os.system("sudo pip3 install dnspython")
+os.system("sudo apt-get install -y dnsmasq")
 time.sleep(5)
 
 # دامنه‌ها برای پروکسی (لیست نمونه، می‌تونی تغییر بدی)
