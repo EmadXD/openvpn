@@ -100,7 +100,7 @@ if __name__ == "__main__":
     try:
         main()
         print("success")
-        time.sleep(460000)
+        time.sleep(900000)
         print("success")
     except:
         print("Error: Could not run xd_limit.py. Please start it manually and check.")
