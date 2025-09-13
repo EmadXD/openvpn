@@ -82,6 +82,7 @@ def disable_systemd_resolved():
     resolv_conf = "/etc/resolv.conf"
     if os.path.islink(resolv_conf) or os.path.exists(resolv_conf):
         print("[+] Removing existing /etc/resolv.conf...")
+        subprocess.run(["sudo", "chattr", "-i", "/etc/resolv.conf"], check=True)
         subprocess.run(["sudo", "rm", "-f", resolv_conf], check=True)
 
     print("[+] Creating new /etc/resolv.conf with Google DNS...")
@@ -156,7 +157,8 @@ def main():
     # تنظیمات iptables
     run_command(["sudo", "iptables", "-t", "mangle", "-F", "PREROUTING"])
     run_command(
-        ["sudo", "iptables", "-t", "mangle", "-A", "PREROUTING", "-s", "10.8.0.0/20", "-m", "set", "--match-set", "proxylist",
+        ["sudo", "iptables", "-t", "mangle", "-A", "PREROUTING", "-s", "10.8.0.0/20", "-m", "set", "--match-set",
+         "proxylist",
          "dst", "-j", "MARK", "--set-mark", "1"])
 
     # تنظیمات ip route
@@ -170,11 +172,13 @@ def main():
     # تنظیمات NAT برای TCP و UDP
     run_command(["sudo", "iptables", "-t", "nat", "-F", "PREROUTING"])
     run_command(
-        ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j", "REDIRECT",
+        ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j",
+         "REDIRECT",
          "--to-ports", "12345"])
     if FORCE_UDP_PROXY:
-        run_command(["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-i", "tun0", "-p", "udp", "!", "--dport", "53", "-j",
-                     "REDIRECT", "--to-ports", "12345"])
+        run_command(
+            ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-i", "tun0", "-p", "udp", "!", "--dport", "53", "-j",
+             "REDIRECT", "--to-ports", "12345"])
 
     print("\n✅ آماده شد!")
     print("تنظیمات فعلی:")
