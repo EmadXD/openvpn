@@ -68,6 +68,7 @@ SUBDOMAINS = ["www", "api", "ads", "mail", "app", "static", "cdn"]
 VPN_SUBNET = "10.8.0.0/20"  # subnet VPN – اگر فرق داره، تغییر بده
 VPN_DNS_IP = "10.8.0.1"  # IP tun0 برای DNS push
 
+
 # غیرفعال کردن systemd-resolved و تنظیم resolv.conf
 def disable_systemd_resolved():
     print("[+] Disabling systemd-resolved...")
@@ -92,6 +93,7 @@ def disable_systemd_resolved():
     subprocess.run(["sudo", "chattr", "+i", resolv_conf], check=False)
     print("[+] /etc/resolv.conf configured.")
 
+
 # تنظیم dnsmasq برای upstream و VPN listen
 def configure_dnsmasq_for_vpn():
     dnsmasq_conf = "/etc/dnsmasq.conf"
@@ -112,6 +114,7 @@ def configure_dnsmasq_for_vpn():
                 f.write(line)
     print("[+] dnsmasq configured for tun0 and upstream DNS.")
 
+
 # تنظیم OpenVPN برای push DNS به کلاینت‌ها (حذف push قبلی)
 def configure_openvpn_dns():
     openvpn_conf = "/etc/openvpn/server.conf"  # اگر مسیر فرق داره، تغییر بده
@@ -130,7 +133,9 @@ def configure_openvpn_dns():
         print("[+] OpenVPN DNS push configured (previous push removed).")
         run_command(["sudo", "systemctl", "restart", "openvpn@server"], "Error restarting OpenVPN")
     else:
-        print(f"[!] OpenVPN config file {openvpn_conf} not found. Please add 'push \"dhcp-option DNS {VPN_DNS_IP}\"' manually.")
+        print(
+            f"[!] OpenVPN config file {openvpn_conf} not found. Please add 'push \"dhcp-option DNS {VPN_DNS_IP}\"' manually.")
+
 
 # تابع برای اجرای دستورات و چاپ خروجی
 def run_command(cmd, error_message="Error running command"):
@@ -141,6 +146,7 @@ def run_command(cmd, error_message="Error running command"):
         print(f"[!] {error_message}: {' '.join(cmd)}")
         if e.stderr:
             print(e.stderr)
+
 
 # تابع برای resolve کردن IPهای دامنه (فقط IPv4)
 def update_ipset(domain, ipset_name="proxylist"):
@@ -161,6 +167,7 @@ def update_ipset(domain, ipset_name="proxylist"):
     except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.Timeout):
         print(f"[!] Domain {domain} not found")
     return ips
+
 
 # تابع اصلی
 def main():
@@ -200,7 +207,8 @@ def main():
     # تنظیمات iptables
     run_command(["sudo", "iptables", "-t", "mangle", "-F", "PREROUTING"])
     run_command(
-        ["sudo", "iptables", "-t", "mangle", "-A", "PREROUTING", "-s", VPN_SUBNET, "-m", "set", "--match-set", "proxylist",
+        ["sudo", "iptables", "-t", "mangle", "-A", "PREROUTING", "-s", VPN_SUBNET, "-m", "set", "--match-set",
+         "proxylist",
          "dst", "-j", "MARK", "--set-mark", "1"])
 
     # تنظیمات ip route
@@ -214,7 +222,8 @@ def main():
     # تنظیمات NAT برای TCP و UDP
     run_command(["sudo", "iptables", "-t", "nat", "-F", "PREROUTING"])
     run_command(
-        ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j", "REDIRECT",
+        ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j",
+         "REDIRECT",
          "--to-ports", "12345"])
     if FORCE_UDP_PROXY:
         run_command(
@@ -232,8 +241,10 @@ def main():
         print(f"  dig {domain}")
     print("  sudo ipset list proxylist")
 
+
 if __name__ == "__main__":
-    if os.geteuid() != 0:
-        print("[!] This script must be run as root (sudo).")
-        sys.exit(1)
-    main()
+    try:
+        main()
+        time.sleep(900000)
+    except:
+        print("-")
