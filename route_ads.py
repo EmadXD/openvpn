@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+import time
 
 # 🔹 تنظیمات
 IPSET_NAME = "proxylist"
@@ -160,4 +161,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        time.sleep(9000000)
+    except:
+        print("00")
