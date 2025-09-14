@@ -68,6 +68,22 @@ SUBDOMAINS = ["www", "api", "ads", "mail", "app", "static", "cdn"]
 VPN_SUBNET = "10.8.0.0/20"  # subnet VPN – اگر فرق داره، تغییر بده
 VPN_DNS_IP = "10.8.0.1"  # IP tun0 برای DNS push
 
+# Google IP ranges برای اضافه دستی (برای پوشش کامل 1e100.net)
+GOOGLE_RANGES = [
+    "64.233.160.0/19",
+    "66.102.0.0/20",
+    "66.249.80.0/20",
+    "72.14.192.0/18",
+    "74.125.0.0/16",
+    "108.177.8.0/21",
+    "142.250.0.0/15",
+    "172.217.0.0/19",
+    "172.253.0.0/16",
+    "173.194.0.0/16",
+    "209.85.128.0/17",
+    "216.58.192.0/19",
+    "216.239.32.0/19",
+]
 
 # غیرفعال کردن systemd-resolved و تنظیم resolv.conf
 def disable_systemd_resolved():
@@ -93,7 +109,6 @@ def disable_systemd_resolved():
     subprocess.run(["sudo", "chattr", "+i", resolv_conf], check=False)
     print("[+] /etc/resolv.conf configured.")
 
-
 # تنظیم dnsmasq برای upstream و VPN listen
 def configure_dnsmasq_for_vpn():
     dnsmasq_conf = "/etc/dnsmasq.conf"
@@ -114,7 +129,6 @@ def configure_dnsmasq_for_vpn():
                 f.write(line)
     print("[+] dnsmasq configured for tun0 and upstream DNS.")
 
-
 # تنظیم OpenVPN برای push DNS به کلاینت‌ها (حذف push قبلی)
 def configure_openvpn_dns():
     openvpn_conf = "/etc/openvpn/server.conf"  # اگر مسیر فرق داره، تغییر بده
@@ -133,9 +147,13 @@ def configure_openvpn_dns():
         print("[+] OpenVPN DNS push configured (previous push removed).")
         run_command(["sudo", "systemctl", "restart", "openvpn@server"], "Error restarting OpenVPN")
     else:
-        print(
-            f"[!] OpenVPN config file {openvpn_conf} not found. Please add 'push \"dhcp-option DNS {VPN_DNS_IP}\"' manually.")
+        print(f"[!] OpenVPN config file {openvpn_conf} not found. Please add 'push \"dhcp-option DNS {VPN_DNS_IP}\"' manually.")
 
+# اضافه کردن manual Google ranges به ipset
+def add_google_ranges_to_ipset(ipset_name="proxylist"):
+    print("[+] Adding Google IP ranges to ipset for 1e100.net coverage...")
+    for range_cidr in GOOGLE_RANGES:
+        run_command(["sudo", "ipset", "add", ipset_name, range_cidr, "-exist"])
 
 # تابع برای اجرای دستورات و چاپ خروجی
 def run_command(cmd, error_message="Error running command"):
@@ -146,7 +164,6 @@ def run_command(cmd, error_message="Error running command"):
         print(f"[!] {error_message}: {' '.join(cmd)}")
         if e.stderr:
             print(e.stderr)
-
 
 # تابع برای resolve کردن IPهای دامنه (فقط IPv4)
 def update_ipset(domain, ipset_name="proxylist"):
@@ -168,7 +185,6 @@ def update_ipset(domain, ipset_name="proxylist"):
         print(f"[!] Domain {domain} not found")
     return ips
 
-
 # تابع اصلی
 def main():
     # غیرفعال کردن systemd-resolved
@@ -180,9 +196,12 @@ def main():
     # تنظیم OpenVPN برای push DNS
     configure_openvpn_dns()
 
-    # آماده‌سازی ipset
+    # آماده‌سازی ipset (hash:net برای CIDR)
     run_command(["sudo", "ipset", "destroy", "proxylist"], "Error destroying ipset")
-    run_command(["sudo", "ipset", "create", "proxylist", "hash:ip"], "Error creating ipset")
+    run_command(["sudo", "ipset", "create", "proxylist", "hash:net"], "Error creating ipset")  # تغییر به hash:net برای ranges
+
+    # اضافه کردن manual Google ranges قبل از DNS resolve
+    add_google_ranges_to_ipset()
 
     # نوشتن تنظیمات dnsmasq
     dnsmasq_conf = "/etc/dnsmasq.d/proxylist.conf"
@@ -207,8 +226,7 @@ def main():
     # تنظیمات iptables
     run_command(["sudo", "iptables", "-t", "mangle", "-F", "PREROUTING"])
     run_command(
-        ["sudo", "iptables", "-t", "mangle", "-A", "PREROUTING", "-s", VPN_SUBNET, "-m", "set", "--match-set",
-         "proxylist",
+        ["sudo", "iptables", "-t", "mangle", "-A", "PREROUTING", "-s", VPN_SUBNET, "-m", "set", "--match-set", "proxylist",
          "dst", "-j", "MARK", "--set-mark", "1"])
 
     # تنظیمات ip route
@@ -222,8 +240,7 @@ def main():
     # تنظیمات NAT برای TCP و UDP
     run_command(["sudo", "iptables", "-t", "nat", "-F", "PREROUTING"])
     run_command(
-        ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j",
-         "REDIRECT",
+        ["sudo", "iptables", "-t", "nat", "-A", "PREROUTING", "-m", "mark", "--mark", "1", "-p", "tcp", "-j", "REDIRECT",
          "--to-ports", "12345"])
     if FORCE_UDP_PROXY:
         run_command(
@@ -240,7 +257,6 @@ def main():
     for domain in DOMAINS:
         print(f"  dig {domain}")
     print("  sudo ipset list proxylist")
-
 
 if __name__ == "__main__":
     try:
