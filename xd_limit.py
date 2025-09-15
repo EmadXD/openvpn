@@ -63,19 +63,22 @@ ubuntu hard nofile 1048576
     append_to_file('/etc/pam.d/common-session', pam_content)
     append_to_file('/etc/pam.d/common-session-noninteractive', pam_content)
 
-    # Step 4: Configure redsocks service limits
-    print("Configuring redsocks service limits...")
-    os.makedirs('/etc/systemd/system/redsocks.service.d', exist_ok=True)
-    override_content = """
-[Service]
-LimitNOFILE=1048576
-"""  # LimitNOFILESoft=1048576
-    with open('/etc/systemd/system/redsocks.service.d/override.conf', 'w') as f:
-        f.write(override_content)
+    try:
+        # Step 4: Configure redsocks service limits
+        print("Configuring redsocks service limits...")
+        os.makedirs('/etc/systemd/system/redsocks.service.d', exist_ok=True)
+        override_content = """
+        [Service]
+        LimitNOFILE=1048576
+        """  # LimitNOFILESoft=1048576
+        with open('/etc/systemd/system/redsocks.service.d/override.conf', 'w') as f:
+            f.write(override_content)
 
-    # Reload systemd and restart redsocks
-    run_command('systemctl daemon-reload')
-    run_command('systemctl restart redsocks')
+        # Reload systemd and restart redsocks
+        run_command('systemctl daemon-reload')
+        run_command('systemctl restart redsocks')
+    except:
+        print("-")
 
     # Step 6: Verify the changes
     print("Verifying file descriptor limits for redsocks...")
