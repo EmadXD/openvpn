@@ -7,7 +7,7 @@ import requests
 
 import time
 
-enable_proxy_random = True
+enable_proxy_random = False
 
 # 🔹 تنظیمات
 IPSET_NAME = "proxylist"
@@ -238,11 +238,7 @@ def set_proxy_redsocks():
         "sudo wget https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/xd_red.conf -O /etc/redsocks.conf")
     time.sleep(5)
 
-    # os.system(
-    #     f"sudo sed -i 's/XD_IP/{proxy__['ip']}/g; s/XD_PORT/{proxy__['port']}/g; s/login = \"emadxd\";/login = \"{proxy__['username']}\";/g; s/password = \"emadxd\";/password = \"{proxy__['password']}\";/g' /etc/redsocks.conf")
-    # time.sleep(2)
-    os.system(
-        f"sudo sed -i 's/XD_IP/socks_main.aparatvpn.com/g; s/XD_PORT/2082/g; s/login = \"emadxd\";/login = \"emadxd\";/g; s/password = \"emadxd\";/password = \"emadxd\";/g' /etc/redsocks.conf")
+    os.system(f"sudo sed -i 's/XD_IP/{proxy__['ip']}/g; s/XD_PORT/{proxy__['port']}/g; s/login = \"emadxd\";/login = \"{proxy__['username']}\";/g; s/password = \"emadxd\";/password = \"{proxy__['password']}\";/g' /etc/redsocks.conf")
     time.sleep(2)
     os.system("sudo systemctl restart redsocks")
 
