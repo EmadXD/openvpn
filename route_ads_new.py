@@ -173,11 +173,6 @@ def setup_tun2socks_routing():
     run_cmd(f"sudo ip route add default via 192.168.255.1 dev {TUN_DEV} table tun2socks")
 
 
-# ---------------- NOTRACK ----------------
-def setup_notrack():
-    run_cmd(f"sudo iptables -t raw -A PREROUTING -i {TUN_DEV} -j NOTRACK")
-    run_cmd(f"sudo iptables -t raw -A OUTPUT -o {TUN_DEV} -j NOTRACK")
-
 
 # ---------------- kernel optimizations ----------------
 def apply_kernel_optimizations():
@@ -230,7 +225,6 @@ def main():
     setup_vpn_forwarding()
     setup_iptables_fwmark()
     setup_tun2socks_routing()
-    setup_notrack()
     apply_kernel_optimizations()
     create_systemd_service()
 
