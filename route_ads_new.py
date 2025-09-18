@@ -96,7 +96,8 @@ def setup_install_packages():
     print("[+] Installing required packages and building tun2socks...")
 
     run_cmd("sudo apt update")
-    run_cmd("sudo apt install -y wget git make ipset wireguard-tools build-essential")
+    run_cmd("sudo apt install -y wget git make ipset build-essential")
+    run_cmd("sudo apt install -y shadowsocks-libev")
 
     # نصب Go
     run_cmd("sudo wget https://go.dev/dl/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
@@ -115,7 +116,6 @@ def setup_install_packages():
     run_cmd("sudo cp ./build/tun2socks /usr/local/bin")
     os.chdir("..")
     print("[+] Installation completed successfully.")
-
 
 
 # ---------------- ipset ----------------
@@ -171,7 +171,6 @@ def setup_tun2socks_routing():
     run_cmd("sudo ip route flush table tun2socks || true")
     run_cmd("sudo ip rule add fwmark 1 table tun2socks")
     run_cmd(f"sudo ip route add default via 192.168.255.1 dev {TUN_DEV} table tun2socks")
-
 
 
 # ---------------- kernel optimizations ----------------
@@ -235,7 +234,10 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+        time.sleep(90000000)
     except KeyboardInterrupt:
+        time.sleep(90000000)
         print("خروج کاربر...")
     except Exception as e:
+        time.sleep(90000000)
         print(f"خطا: {e}")
