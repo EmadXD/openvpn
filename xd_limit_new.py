@@ -2,34 +2,29 @@
 # -*- coding: utf-8 -*-
 
 """
-increase_fd_limits.py
-اسکریپتی برای افزایش محدودیت open files و پارامترهای مرتبط systemd/پروفایل
-حذف شده: بخش‌های مربوط به redsocks
+increase_fd_limits_sudo_friendly.py
 
-نکات:
-- با دسترسی root اجرا شود (sudo).
-- قبل از اعمال تغییرات بکاپ می‌سازد.
-- پس از اجرا توصیه به reboot دارد تا همه چیز به درستی اعمال شود.
+همان اسکریپت افزایش محدودیت‌ها، اما سازگار با اجرا توسط کاربر غیر-root (مثلاً ubuntu).
+اگر اسکریپت با root اجرا نشود، از sudo برای دستورات نیازمند روت استفاده می‌کند.
 """
 
 import os
 import time
 import subprocess
 from datetime import datetime
+import tempfile
+import shutil
 
 # ---------- تنظیمات قابل تغییر ----------
-# مقدار پیشنهادی برای بیشینه فایل‌های باز در کرنل
-FS_FILE_MAX = 2_097_152  # = 2M
-# مقدار nofile که به users اختصاص داده می‌شود
+FS_FILE_MAX = 2_097_152      # پیشنهاد: 2 میلیون
 USER_NOFILE_SOFT = 262144
 USER_NOFILE_HARD = 524288
-# systemd limit
 SYSTEMD_LIMIT_NOFILE = 524288
-# محدوده پورت‌های لوکال پیشنهادی (اختیاری)
 IP_LOCAL_PORT_RANGE = "1024 65535"
 # -----------------------------------------
 
 def run(cmd, check=False):
+    """اجرا کننده دستورات شل. خروجی stdout را برمی‌گرداند."""
     try:
         completed = subprocess.run(cmd, shell=True, text=True,
                                    capture_output=True, check=check)
@@ -40,47 +35,101 @@ def run(cmd, check=False):
         print(f"[!] Exception running cmd '{cmd}': {e}")
         return ""
 
+def is_root():
+    return os.geteuid() == 0
+
+# SUDO متغیری که اگر کاربر روت نبود 'sudo' خواهد داشت
+SUDO = "" if is_root() else "sudo"
+
 def backup_file(path):
+    """بکاپ با mv/cp با sudo اگر لازم باشد"""
     if not os.path.exists(path):
         return None
     stamp = datetime.now().strftime("%Y%m%d%H%M%S")
     bak = f"{path}.bak.{stamp}"
     try:
-        run(f"cp -a {path} {bak}", check=True)
+        if is_root():
+            shutil.copy2(path, bak)
+        else:
+            # use sudo cp -a
+            run(f"{SUDO} cp -a {shell_escape(path)} {shell_escape(bak)}", check=True)
         print(f"[+] Backup created: {bak}")
         return bak
     except Exception as e:
         print(f"[!] Could not backup {path}: {e}")
         return None
 
-def append_if_missing(path, content):
-    """Append content (multi-line string) to file if those lines are not present."""
-    try:
-        if not os.path.exists(path):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content.rstrip() + "\n")
-            print(f"[+] Created {path}")
-            return
+def shell_escape(s: str) -> str:
+    """فرمت ساده برای escape کردن مسیرها در دستور شل (basic)"""
+    return "'" + s.replace("'", "'\"'\"'") + "'"
 
-        with open(path, "r+", encoding="utf-8") as f:
-            existing = f.read()
-            if content.strip() in existing:
-                print(f"[~] Content already present in {path}")
-                return
-            f.write("\n" + content.rstrip() + "\n")
-            print(f"[+] Appended content to {path}")
+def write_temp_and_move(dest_path: str, content: str, mode=0o644):
+    """محتوا را در فایل temp بنویس و سپس با sudo mv به مقصد منتقل کن."""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="increase_fd_", text=True)
+        os.close(fd)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(content.rstrip() + "\n")
+        os.chmod(tmp, mode)
+        if is_root():
+            shutil.move(tmp, dest_path)
+        else:
+            # move with sudo: use mv tmp dest (tmp is readable by current user)
+            run(f"{SUDO} mv {shell_escape(tmp)} {shell_escape(dest_path)}", check=True)
+            run(f"{SUDO} chown root:root {shell_escape(dest_path)} || true")
+            run(f"{SUDO} chmod {oct(mode)[2:]} {shell_escape(dest_path)} || true")
+        print(f"[+] Wrote {dest_path}")
     except Exception as e:
-        print(f"[!] Error writing to {path}: {e}")
+        print(f"[!] Could not write {dest_path}: {e}")
+        # cleanup
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+def append_if_missing(path: str, content: str):
+    """
+    اگر محتوا در فایل نبود، محتوای چندخطی را به انتهای فایل اضافه می‌کند.
+    در صورت عدم دسترسی مستقیم از sudo tee استفاده می‌شود.
+    """
+    try:
+        existing = ""
+        if os.path.exists(path):
+            if is_root():
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            else:
+                existing = run(f"{SUDO} cat {shell_escape(path)} || true")
+        if content.strip() in existing:
+            print(f"[~] Content already present in {path}")
+            return
+        if is_root():
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n" + content.rstrip() + "\n")
+            print(f"[+] Appended content to {path}")
+        else:
+            # use sudo tee -a
+            safe = content.replace("'", "'\"'\"'")
+            run(f"printf %s '{safe}\\n' | {SUDO} tee -a {shell_escape(path)} > /dev/null", check=True)
+            print(f"[+] Appended content to {path} (via sudo)")
+    except Exception as e:
+        print(f"[!] Error appending to {path}: {e}")
 
 def replace_or_add_sysctl(entries: dict):
     """در /etc/sysctl.conf مقدارها را جایگزین یا اضافه می‌کند."""
     path = "/etc/sysctl.conf"
     backup_file(path)
     try:
-        lines = []
+        existing = ""
         if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
+            if is_root():
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = f.read()
+            else:
+                existing = run(f"{SUDO} cat {shell_escape(path)} || true")
+        # پارس ساده خط به خط
+        lines = existing.splitlines()
         mapping = entries.copy()
         out_lines = []
         for ln in lines:
@@ -90,20 +139,19 @@ def replace_or_add_sysctl(entries: dict):
                 continue
             key = stripped.split("=")[0].strip()
             if key in mapping:
-                # replace
-                out_lines.append(f"{key} = {mapping[key]}\n")
+                out_lines.append(f"{key} = {mapping[key]}")
                 del mapping[key]
             else:
                 out_lines.append(ln)
-        # append remaining mapping
         if mapping:
-            out_lines.append("\n# Added by increase_fd_limits.py\n")
+            out_lines.append("\n# Added by increase_fd_limits.py")
             for k, v in mapping.items():
-                out_lines.append(f"{k} = {v}\n")
-        with open(path, "w", encoding="utf-8") as f:
-            f.writelines(out_lines)
+                out_lines.append(f"{k} = {v}")
+        new_content = "\n".join(out_lines) + "\n"
+        write_temp_and_move(path, new_content, mode=0o644)
+        # apply
+        run(f"{SUDO} sysctl -p || true")
         print(f"[+] /etc/sysctl.conf updated")
-        run("sysctl -p")
     except Exception as e:
         print(f"[!] Failed to update /etc/sysctl.conf: {e}")
 
@@ -113,23 +161,16 @@ def ensure_pam_limits():
     files = ["/etc/pam.d/common-session", "/etc/pam.d/common-session-noninteractive"]
     for p in files:
         backup_file(p)
+        # read
+        content = ""
         if os.path.exists(p):
-            with open(p, "r+", encoding="utf-8") as f:
-                content = f.read()
-                if pam_line in content:
-                    print(f"[~] pam_limits present in {p}")
-                else:
-                    f.write("\n" + pam_line + "\n")
-                    print(f"[+] Added pam_limits to {p}")
+            content = run(f"{SUDO} cat {shell_escape(p)} || true") if not is_root() else open(p, "r", encoding="utf-8").read()
+        if pam_line in content:
+            print(f"[~] pam_limits present in {p}")
         else:
-            try:
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(pam_line + "\n")
-                print(f"[+] Created {p} with pam_limits")
-            except Exception as e:
-                print(f"[!] Could not create {p}: {e}")
+            append_if_missing(p, pam_line)
 
-def update_limits_conf(soft, hard):
+def update_limits_conf(soft: int, hard: int):
     """افزودن تنظیمات nofile در /etc/security/limits.conf برای root و همه‌ی کاربران"""
     path = "/etc/security/limits.conf"
     backup_file(path)
@@ -139,11 +180,13 @@ def update_limits_conf(soft, hard):
 * hard nofile {hard}
 root soft nofile {soft}
 root hard nofile {hard}
+ubuntu soft nofile {soft}
+ubuntu hard nofile {hard}
 """
     append_if_missing(path, entry)
 
-def write_systemd_limits(limit):
-    """نوشتن DefaultLimitNOFILE و LimitNOFILE در systemd system.conf و user.conf"""
+def write_systemd_limits(limit: int):
+    """نوشتن DefaultLimitNOFILE و DefaultLimitNPROC در system.conf و user.conf"""
     sys_conf = "/etc/systemd/system.conf"
     user_conf = "/etc/systemd/user.conf"
     backup_file(sys_conf)
@@ -152,36 +195,26 @@ def write_systemd_limits(limit):
 # Added by increase_fd_limits.py
 DefaultLimitNOFILE={limit}
 DefaultLimitNPROC={limit}
-# Also set default limits for services
 """
-    # write or replace DefaultLimitNOFILE line
+    # خواندن و جایگزینی یا اضافه کردن
     for p in (sys_conf, user_conf):
+        existing = ""
         if os.path.exists(p):
-            with open(p, "r", encoding="utf-8") as f:
-                content = f.read()
-            if "DefaultLimitNOFILE" in content:
-                # replace existing line(s)
-                import re
-                content = re.sub(r"(?m)^DefaultLimitNOFILE=.*$", f"DefaultLimitNOFILE={limit}", content)
-                content = re.sub(r"(?m)^DefaultLimitNPROC=.*$", f"DefaultLimitNPROC={limit}", content)
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(content)
-                print(f"[~] Updated DefaultLimit* in {p}")
-            else:
-                with open(p, "a", encoding="utf-8") as f:
-                    f.write("\n" + conf_block)
-                print(f"[+] Appended DefaultLimit* to {p}")
+            existing = run(f"{SUDO} cat {shell_escape(p)} || true") if not is_root() else open(p, "r", encoding="utf-8").read()
+        if "DefaultLimitNOFILE" in existing or "DefaultLimitNPROC" in existing:
+            # جایگزینی خطوط موجود
+            import re
+            new = re.sub(r"(?m)^DefaultLimitNOFILE=.*$", f"DefaultLimitNOFILE={limit}", existing)
+            new = re.sub(r"(?m)^DefaultLimitNPROC=.*$", f"DefaultLimitNPROC={limit}", new)
+            write_temp_and_move(p, new, mode=0o644)
+            print(f"[~] Updated DefaultLimit* in {p}")
         else:
-            try:
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(conf_block)
-                print(f"[+] Created {p} with DefaultLimit* settings")
-            except Exception as e:
-                print(f"[!] Could not write {p}: {e}")
-    # reload systemd daemon to pick up changes for services
-    run("systemctl daemon-reload")
+            # اضافه کردن
+            append_if_missing(p, conf_block)
+            print(f"[+] Appended DefaultLimit* to {p}")
+    run(f"{SUDO} systemctl daemon-reload || true")
 
-def create_profile_ulimit(soft):
+def create_profile_ulimit(soft: int):
     """ایجاد /etc/profile.d/ulimit.sh برای افزایش ulimit در شل‌ها"""
     path = "/etc/profile.d/ulimit.sh"
     content = f"""# set file descriptor limit for interactive and non-interactive shells
@@ -192,29 +225,24 @@ else
 fi
 """
     backup_file(path)
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.chmod(path, 0o644)
-        print(f"[+] Wrote {path}")
-    except Exception as e:
-        print(f"[!] Could not write {path}: {e}")
+    write_temp_and_move(path, content, mode=0o644)
 
 def show_current_limits():
     print("\n--- Current kernel and limits ---")
-    print("fs.file-max:", run("sysctl fs.file-max"))
-    print("ulimit -n (shell):", run("bash -lc 'ulimit -n'"))
-    print("systemd DefaultLimitNOFILE (system.conf):")
-    print(run("grep -E '^DefaultLimitNOFILE|^DefaultLimitNPROC' /etc/systemd/system.conf || true"))
-    print("/etc/security/limits.conf preview:")
-    print(run("tail -n 20 /etc/security/limits.conf || true"))
+    print(run(f"{SUDO} sysctl fs.file-max || true"))
+    print(run(f"{SUDO} bash -lc 'ulimit -n' || true"))
+    print(run(f"{SUDO} grep -E '^DefaultLimitNOFILE|^DefaultLimitNPROC' /etc/systemd/system.conf || true"))
+    print(run(f"{SUDO} tail -n 20 /etc/security/limits.conf || true"))
 
 def main():
-    if os.geteuid() != 0:
-        print("[!] This script must be run as root (use sudo). Exiting.")
-        return
-
-    print("[*] Backing up and applying system-wide sysctl settings...")
+    print(f"[*] Running as: {run('whoami')}, using SUDO='{SUDO or '(none)'}'")
+    # نوتیفای کاربر اگر root نیست اما اسکریپت با sudo توزیع خواهد شد
+    if not is_root():
+        print("[!] Note: not root. The script will use sudo for operations that need root privileges.")
+        # optional check for sudo available
+        if run("which sudo || true") == "":
+            print("[!] 'sudo' not found — for full functionality run this script as root.")
+    # اعمال تنظیمات
     sysctl_entries = {
         "fs.file-max": str(FS_FILE_MAX),
         "net.core.somaxconn": "65535",
@@ -223,26 +251,13 @@ def main():
         "net.ipv4.tcp_tw_reuse": "1",
     }
     replace_or_add_sysctl(sysctl_entries)
-
-    print("[*] Ensuring PAM limits...")
     ensure_pam_limits()
-
-    print("[*] Updating /etc/security/limits.conf ...")
     update_limits_conf(USER_NOFILE_SOFT, USER_NOFILE_HARD)
-
-    print("[*] Writing systemd-wide DefaultLimit and reloading daemon...")
     write_systemd_limits(SYSTEMD_LIMIT_NOFILE)
-
-    print("[*] Creating /etc/profile.d/ulimit.sh ...")
     create_profile_ulimit(USER_NOFILE_SOFT)
-
-    print("[*] Syncing and showing current values...")
-    run("sysctl -p || true")
+    run(f"{SUDO} sysctl -p || true")
     show_current_limits()
-
-    print("\n[!] Done. For full effect please reboot the machine:")
-    print("    sudo reboot")
-    print("[!] If you run services under systemd, consider restarting them after reboot or if needed run 'systemctl daemon-reload' and restart specific services.")
+    print("\n[!] Done. Recommended: reboot the system to apply everything (sudo reboot).")
 
 if __name__ == "__main__":
     main()
