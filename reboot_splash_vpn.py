@@ -50,9 +50,10 @@ def get_main_ip():
 if __name__ == "__main__":
     while True:
         try:
-            os.system("sudo apt install python3-pip -y")
+            os.system("sudo apt-get install python3-pip -y")
             time.sleep(30)
-            os.system("sudo pip3 install requests")
+            # os.system("sudo pip3 install requests")
+            os.system("pip3 install --user requests")
             time.sleep(30)
             self_ip = get_main_ip()
 
