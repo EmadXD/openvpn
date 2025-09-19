@@ -3,26 +3,12 @@ import random
 import subprocess
 
 import time
-from datetime import datetime
-import pytz
 import requests
-
-tehran_tz = pytz.timezone("Asia/Tehran")
 
 domains = [
     "https://aparatvpn.com",
     "https://us.xdvpn.com",
 ]
-
-
-def should_reboot():
-    try:
-        now = datetime.now(tehran_tz)
-        if 4 <= now.hour < 5:
-            return False
-        return True
-    except:
-        return True
 
 
 def reboot_server():
@@ -72,9 +58,8 @@ if __name__ == "__main__":
 
             safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=online")
 
-            #time.sleep(random.randint(900, 1800))
+            # time.sleep(random.randint(900, 1800))
             time.sleep(random.randint(5000, 8000))
-
 
             safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=offline")
 
