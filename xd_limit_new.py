@@ -2,6 +2,7 @@
 import os
 import subprocess
 import shutil
+import time
 from datetime import datetime
 
 SUDO = "" if os.geteuid() == 0 else "sudo"
@@ -14,12 +15,15 @@ USER_NOFILE_SOFT = 262_144
 USER_NOFILE_HARD = 524_288
 IP_LOCAL_PORT_RANGE = "1024 65535"
 POSSIBLE_SERVICES = ["shadowsocks-libev.service", "ss-server.service"]
+
+
 # -----------------------------
 
 def run(cmd):
     print("[*]", cmd)
     return subprocess.run(cmd, shell=True, text=True,
                           capture_output=True).stdout.strip()
+
 
 def backup(path):
     if not os.path.exists(path):
@@ -32,6 +36,7 @@ def backup(path):
         run(f"{SUDO} cp -a {path} {bak}")
     print(f"[+] backup -> {bak}")
 
+
 def write_temp_and_move(dest, content, mode=0o644):
     tmp = "/tmp/tmpfile_for_raise_limits"
     with open(tmp, "w") as f:
@@ -43,6 +48,7 @@ def write_temp_and_move(dest, content, mode=0o644):
         run(f"{SUDO} mv {tmp} {dest}")
         run(f"{SUDO} chown root:root {dest} || true")
     print(f"[+] wrote {dest}")
+
 
 def set_runtime_sysctl():
     entries = {
@@ -68,6 +74,7 @@ def set_runtime_sysctl():
         new_lines.append(f"{k} = {v}")
     write_temp_and_move(path, "\n".join(new_lines))
 
+
 def ensure_pam_limits():
     pam_line = "session required pam_limits.so"
     for p in ["/etc/pam.d/common-session", "/etc/pam.d/common-session-noninteractive"]:
@@ -78,6 +85,7 @@ def ensure_pam_limits():
                 with open(p, "a") as f:
                     f.write("\n" + pam_line + "\n")
                 print(f"[+] appended pam_limits to {p}")
+
 
 def update_limits_conf():
     path = "/etc/security/limits.conf"
@@ -98,6 +106,7 @@ ubuntu hard nofile {USER_NOFILE_HARD}
             f.write("\n" + entry + "\n")
             print(f"[+] appended limits.conf entries")
 
+
 def write_systemd_defaults():
     for conf in ("/etc/systemd/system.conf", "/etc/systemd/user.conf"):
         backup(conf)
@@ -106,11 +115,13 @@ def write_systemd_defaults():
                 content = f.read()
         except:
             content = ""
-        lines = [line for line in content.splitlines() if not line.startswith("DefaultLimitNOFILE") and not line.startswith("DefaultLimitNPROC")]
+        lines = [line for line in content.splitlines() if
+                 not line.startswith("DefaultLimitNOFILE") and not line.startswith("DefaultLimitNPROC")]
         lines.append(f"\n# Added by raise_limits_persist.py")
         lines.append(f"DefaultLimitNOFILE={DEFAULT_LIMIT_NOFILE}")
         lines.append(f"DefaultLimitNPROC={DEFAULT_LIMIT_NPROC}")
         write_temp_and_move(conf, "\n".join(lines))
+
 
 def apply_systemd_override_if_service_exists():
     out = run("systemctl list-units --type=service --all --no-legend")
@@ -138,6 +149,7 @@ LimitNPROC={DEFAULT_LIMIT_NPROC}
                 run(f"{SUDO} systemctl restart {svc}")
                 print(f"[+] systemd override applied and restarted {svc}")
 
+
 def apply_prlimit_to_ss():
     pid_out = run("pidof ss-server || true")
     if not pid_out:
@@ -148,6 +160,7 @@ def apply_prlimit_to_ss():
         run(f"{SUDO} prlimit --pid {p} --nofile={DEFAULT_LIMIT_NOFILE}:{DEFAULT_LIMIT_NOFILE} --nproc={DEFAULT_LIMIT_NPROC}:{DEFAULT_LIMIT_NPROC}")
         print(f"[+] prlimit applied to pid {p}")
 
+
 def main():
     set_runtime_sysctl()
     ensure_pam_limits()
@@ -157,5 +170,7 @@ def main():
     apply_prlimit_to_ss()
     print("\n✅ All limits raised (persistent, no reboot needed).")
 
+
 if __name__ == "__main__":
     main()
+    time.sleep(900000)
