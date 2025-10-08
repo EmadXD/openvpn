@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 import os
+import re
 import subprocess
 import sys
+
 import time
 
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
 VPN_SUBNET = "10.8.0.0/20"
 PROXY_TABLE = "100"  # شماره routing table برای پروکسی
+
+
+def clean_proxy_url(raw_url: str) -> str:
+    url = raw_url.strip().replace('\ufeff', '')
+    url = re.sub(r'\s+', '', url)
+    if not url.startswith("socks5://") and not url.startswith("http://") and not url.startswith("https://"):
+        url = "socks5://" + url
+    url = url.rstrip('/')
+    return url
+
 
 DOMAINS = [
     "browserleaks.com",
@@ -98,6 +110,9 @@ def setup_install_packages():
     run_cmd("sudo apt update")
     run_cmd("sudo apt install -y wget git make ipset build-essential")
     run_cmd("sudo apt install -y shadowsocks-libev")
+
+    run_cmd("sudo apt-get install python3-pip -y")
+    run_cmd("sudo pip3 install requests")
 
     # نصب Go
     run_cmd("sudo wget https://go.dev/dl/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
@@ -190,6 +205,14 @@ def apply_kernel_optimizations():
 
 # ---------------- systemd service ----------------
 def create_systemd_service():
+    try:
+        import requests
+        SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
+        SOCKS_PROXY = clean_proxy_url(SOCKS_PROXY)
+    except:
+        print("---")
+    print(SOCKS_PROXY)
+
     service_content = f"""[Unit]
 Description=Tun2Socks Service
 After=network.target
