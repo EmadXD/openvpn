@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 import os
+import re
 import subprocess
 import sys
-from time import sleep
-
-import requests
 
 import time
 
@@ -12,6 +10,16 @@ import time
 IPSET_NAME = "proxylist"
 VPN_SUBNET = "10.8.0.0/20"
 PROXY_TABLE = "100"  # شماره routing table برای پروکسی
+
+
+def clean_proxy_url(raw_url: str) -> str:
+    url = raw_url.strip().replace('\ufeff', '')
+    url = re.sub(r'\s+', '', url)
+    if not url.startswith("socks5://") and not url.startswith("http://") and not url.startswith("https://"):
+        url = "socks5://" + url
+    url = url.rstrip('/')
+    return url
+
 
 DOMAINS = [
     "browserleaks.com",
@@ -79,11 +87,6 @@ GOOGLE_RANGES = [
 TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
 SOCKS_PROXY = "socks5://127.0.0.1:1080"
-try:
-    SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
-except:
-    print("---")
-print(SOCKS_PROXY)
 
 
 # ---------------- توابع کمکی ----------------
@@ -107,6 +110,9 @@ def setup_install_packages():
     run_cmd("sudo apt update")
     run_cmd("sudo apt install -y wget git make ipset build-essential")
     run_cmd("sudo apt install -y shadowsocks-libev")
+
+    run_cmd("sudo apt-get install python3-pip -y")
+    run_cmd("sudo pip3 install requests")
 
     # نصب Go
     run_cmd("sudo wget https://go.dev/dl/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
@@ -199,6 +205,14 @@ def apply_kernel_optimizations():
 
 # ---------------- systemd service ----------------
 def create_systemd_service():
+    try:
+        import requests
+        SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
+        SOCKS_PROXY = clean_proxy_url(SOCKS_PROXY)
+    except:
+        print("---")
+    print(SOCKS_PROXY)
+
     service_content = f"""[Unit]
 Description=Tun2Socks Service
 After=network.target
@@ -214,14 +228,9 @@ WantedBy=multi-user.target
     path = "/etc/systemd/system/tun2socks.service"
     with open(path, "w") as f:
         f.write(service_content)
-    sleep(3)
     run_cmd("sudo systemctl daemon-reload")
-    sleep(3)
     run_cmd("sudo systemctl enable --now tun2socks.service")
-    sleep(3)
     run_cmd("sudo systemctl start tun2socks.service")
-    sleep(3)
-    run_cmd("sudo systemctl restart tun2socks.service")
 
 
 # ---------------- main ----------------
