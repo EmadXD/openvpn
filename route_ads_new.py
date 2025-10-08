@@ -78,8 +78,11 @@ GOOGLE_RANGES = [
 
 TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
-# SOCKS_PROXY = "socks5://127.0.0.1:1080"
-SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
+SOCKS_PROXY = "socks5://127.0.0.1:1080"
+try:
+    SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
+except:
+    print("---")
 print(SOCKS_PROXY)
 
 
