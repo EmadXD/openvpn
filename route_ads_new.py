@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+from time import sleep
 
 import requests
 
@@ -79,6 +80,7 @@ TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
 # SOCKS_PROXY = "socks5://127.0.0.1:1080"
 SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
+print(SOCKS_PROXY)
 
 
 # ---------------- توابع کمکی ----------------
@@ -209,9 +211,14 @@ WantedBy=multi-user.target
     path = "/etc/systemd/system/tun2socks.service"
     with open(path, "w") as f:
         f.write(service_content)
+    sleep(3)
     run_cmd("sudo systemctl daemon-reload")
+    sleep(3)
     run_cmd("sudo systemctl enable --now tun2socks.service")
+    sleep(3)
     run_cmd("sudo systemctl start tun2socks.service")
+    sleep(3)
+    run_cmd("sudo systemctl restart tun2socks.service")
 
 
 # ---------------- main ----------------
