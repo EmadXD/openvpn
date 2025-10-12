@@ -8,6 +8,9 @@ domains = [
     "https://us.xdvpn.com",
 ]
 
+restart_pm2_tun2socks = True
+
+
 def reboot_server():
     try:
         os.system("sudo reboot")
@@ -45,6 +48,12 @@ def get_main_ip():
         return None
 
 
+reboot_hour_server_min = 1.75
+reboot_hour_server_max = 2
+
+restart_script_minutes_server_min = 10
+restart_script_minutes_server_max = 15
+
 if __name__ == "__main__":
     while True:
         try:
@@ -56,7 +65,17 @@ if __name__ == "__main__":
 
             safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=online")
 
-            time.sleep(random.randint(5000, 7000))
+            sec_wait_random = random.randint(int(reboot_hour_server_min * 3600), int(reboot_hour_server_max * 3600))
+            if restart_pm2_tun2socks:
+                sec_wait_restart = random.randint(int(restart_script_minutes_server_min * 60),
+                                                  int(restart_script_minutes_server_max * 60))
+                for i in range(int(sec_wait_random / sec_wait_restart)):  # ---7000/500 = 14 count for
+                    time.sleep(sec_wait_restart)
+                    os.system("sudo systemctl restart tun2socks")
+                    time.sleep(10)
+                    os.system("sudo pm2 restart 4")
+            else:
+                time.sleep(sec_wait_random)
 
             safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=offline")
 
