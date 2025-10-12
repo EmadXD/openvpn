@@ -6,7 +6,7 @@ import sys
 import requests
 import time
 
-full_route_to_proxy = False  # ---if True only use port 80,443
+full_route_to_proxy = True  # ---if True only use port 80,443
 
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
