@@ -6,6 +6,8 @@ import sys
 import requests
 import time
 
+full_route_to_proxy = False  # ---if True only use port 80,443
+
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
 VPN_SUBNET = "10.8.0.0/20"
@@ -65,6 +67,7 @@ DOMAINS = [
 GOOGLE_RANGES = requests.get(
     "https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/google_ip_list.json").json()
 
+
 # ---------------- توابع کمکی ----------------
 def run_cmd(cmd):
     print(f"[+] Running: {cmd}")
@@ -78,6 +81,7 @@ def run_cmd(cmd):
         if e.stderr:
             print(e.stderr.strip())
 
+
 def clean_proxy_url(raw_url: str) -> str:
     url = raw_url.strip().replace('\ufeff', '')
     url = re.sub(r'\s+', '', url)
@@ -85,6 +89,7 @@ def clean_proxy_url(raw_url: str) -> str:
         url = "socks5://" + url
     url = url.rstrip('/')
     return url
+
 
 # ---------------- نصب بسته‌ها ----------------
 def setup_install_packages():
@@ -115,15 +120,18 @@ def setup_install_packages():
     os.chdir("..")
     print("[+] Installation completed successfully.")
 
+
 # ---------------- ipset ----------------
 def setup_ipset():
     run_cmd(f"ipset destroy {IPSET_NAME} || true")
     run_cmd(f"ipset create {IPSET_NAME} hash:net || true")
 
+
 def add_google_ranges_to_ipset():
     print("[+] Adding Google IP ranges...")
     for range_cidr in GOOGLE_RANGES:
         run_cmd(f"ipset add {IPSET_NAME} {range_cidr} -exist")
+
 
 def update_ipset():
     for domain in DOMAINS:
@@ -139,6 +147,7 @@ def update_ipset():
         except Exception as e:
             print(f"[!] Error resolving {domain}: {e}")
 
+
 # ---------------- tun2socks ----------------
 def setup_tun2socks_interface():
     # اگر interface موجود نیست بساز
@@ -148,21 +157,31 @@ def setup_tun2socks_interface():
     # مطمئن شو interface up است
     run_cmd(f"ip link set {TUN_DEV} up")
 
+
 def setup_vpn_forwarding():
     run_cmd(f"iptables -A FORWARD -s {VPN_SUBNET} -o {TUN_DEV} -j ACCEPT")
     run_cmd(f"iptables -A FORWARD -d {VPN_SUBNET} -i {TUN_DEV} -m state --state RELATED,ESTABLISHED -j ACCEPT")
     run_cmd(f"iptables -t nat -A POSTROUTING -o {TUN_DEV} -s {VPN_SUBNET} -j MASQUERADE")
 
+
 def setup_iptables_fwmark():
     run_cmd("iptables -t mangle -F PREROUTING")
-    run_cmd(f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+    if full_route_to_proxy:
+        run_cmd(
+            f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+    else:
+        run_cmd(
+            f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} -p tcp -m multiport --dports 80,443,8080,8443 -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+
 
 def setup_tun2socks_routing():
-    run_cmd(f"grep -q '^{PROXY_TABLE} tun2socks' /etc/iproute2/rt_tables || echo '{PROXY_TABLE} tun2socks' >> /etc/iproute2/rt_tables")
+    run_cmd(
+        f"grep -q '^{PROXY_TABLE} tun2socks' /etc/iproute2/rt_tables || echo '{PROXY_TABLE} tun2socks' >> /etc/iproute2/rt_tables")
     run_cmd("ip rule del fwmark 1 table tun2socks || true")
     run_cmd("ip route flush table tun2socks || true")
     run_cmd("ip rule add fwmark 1 table tun2socks")
     run_cmd(f"ip route add default via {TUN_ADDR.split('/')[0]} dev {TUN_DEV} table tun2socks")
+
 
 # ---------------- kernel optimizations ----------------
 def apply_kernel_optimizations():
@@ -177,6 +196,7 @@ def apply_kernel_optimizations():
     }
     for key, value in sysctl_settings.items():
         run_cmd(f"sysctl -w {key}={value}")
+
 
 # ---------------- systemd service ----------------
 def create_systemd_service():
@@ -211,6 +231,7 @@ WantedBy=multi-user.target
     run_cmd("systemctl enable --now tun2socks.service")
     run_cmd("systemctl start tun2socks.service")
 
+
 # ---------------- main ----------------
 def main():
     if os.geteuid() != 0:
@@ -232,6 +253,7 @@ def main():
     create_systemd_service()
 
     print("\n[+] آماده شد! ترافیک Google و دامنه‌ها از طریق tun2socks عبور می‌کند.")
+
 
 if __name__ == "__main__":
     try:
