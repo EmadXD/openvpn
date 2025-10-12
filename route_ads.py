@@ -218,7 +218,7 @@ def main():
         sys.exit(1)
 
     # کوتاه صبر کن تا network stack آماده شود
-    time.sleep(3)
+    time.sleep(15)
 
     setup_install_packages()
     setup_ipset()
