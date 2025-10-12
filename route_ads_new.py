@@ -267,6 +267,8 @@ def main():
     if os.geteuid() != 0:
         print("[!] لطفاً اسکریپت را با sudo اجرا کنید")
         sys.exit(1)
+    
+    time.sleep(20)
 
     setup_install_packages()
     setup_ipset()
