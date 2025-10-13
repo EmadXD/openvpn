@@ -63,6 +63,14 @@ DOMAINS = [
     "support.google.com",
     "tpc.googlesyndication.com",
 ]
+if use_udp_shadowsocks:
+    DOMAINS.extend([
+        "stun.l.google.com",
+        "stun1.l.google.com",
+        "stun2.l.google.com",
+        "stun3.l.google.com",
+        "stun4.l.google.com",
+    ])
 
 GOOGLE_RANGES = requests.get(
     "https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/google_ip_list.json").json()
