@@ -7,7 +7,7 @@ import requests
 import time
 
 full_route_to_proxy = True  # ---if True only use port 80,443
-
+use_udp_shadowsocks = True
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
 VPN_SUBNET = "10.8.0.0/20"
@@ -104,6 +104,34 @@ def setup_install_packages():
     run_cmd("apt update")
     run_cmd("apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip")
     run_cmd("pip3 install requests")
+
+    # ------------------------------------------------------------------------------------------
+    if use_udp_shadowsocks:
+        path_shadowsocks_config = "/lib/systemd/system/shadowsocks-libev.service"
+        shadowsocks_config = """[Unit]
+Description=Shadowsocks-libev Default Server Service
+Documentation=man:shadowsocks-libev(8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+DynamicUser=true
+EnvironmentFile=/etc/default/shadowsocks-libev
+LimitNOFILE=32768
+ExecStart=/usr/bin/ss-server -c $CONFFILE $DAEMON_ARGS -u
+
+[Install]
+WantedBy=multi-user.target"""
+        with open(path_shadowsocks_config, "w") as f:
+            f.write(shadowsocks_config)
+
+        run_cmd("sudo systemctl daemon-reload")
+        run_cmd("sudo systemctl enable --now shadowsocks-libev")
+        run_cmd("sudo systemctl start shadowsocks-libev")
+    # ------------------------------------------------------------------------------------------
 
     # نصب Go
     run_cmd("wget https://go.dev/dl/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
@@ -227,9 +255,9 @@ WantedBy=multi-user.target
     with open(path, "w") as f:
         f.write(service_content)
 
-    run_cmd("systemctl daemon-reload")
-    run_cmd("systemctl enable --now tun2socks.service")
-    run_cmd("systemctl start tun2socks.service")
+    run_cmd("sudo systemctl daemon-reload")
+    run_cmd("sudo systemctl enable --now tun2socks.service")
+    run_cmd("sudo systemctl start tun2socks.service")
 
 
 # ---------------- main ----------------
