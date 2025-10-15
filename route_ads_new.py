@@ -9,7 +9,7 @@ import time
 full_route_to_proxy = True  # ---if True only use port 80,443
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
-VPN_SUBNET = "10.8.0.0/20"
+VPN_SUBNET = "10.8.0.0/14"
 PROXY_TABLE = "100"  # شماره routing table برای پروکسی
 TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
