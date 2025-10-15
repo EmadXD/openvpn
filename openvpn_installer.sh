@@ -116,7 +116,7 @@ function installUnbound() {
 
 			# Configuration
 			echo 'interface: 10.8.0.1
-access-control: 10.8.0.1/20 allow
+access-control: 10.8.0.1/14 allow
 hide-identity: yes
 hide-version: yes
 use-caps-for-id: yes
@@ -127,7 +127,7 @@ prefetch: yes' >>/etc/unbound/unbound.conf
 
 			# Configuration
 			sed -i 's|# interface: 0.0.0.0$|interface: 10.8.0.1|' /etc/unbound/unbound.conf
-			sed -i 's|# access-control: 127.0.0.0/8 allow|access-control: 10.8.0.1/20 allow|' /etc/unbound/unbound.conf
+			sed -i 's|# access-control: 127.0.0.0/8 allow|access-control: 10.8.0.1/14 allow|' /etc/unbound/unbound.conf
 			sed -i 's|# hide-identity: no|hide-identity: yes|' /etc/unbound/unbound.conf
 			sed -i 's|# hide-version: no|hide-version: yes|' /etc/unbound/unbound.conf
 			sed -i 's|use-caps-for-id: no|use-caps-for-id: yes|' /etc/unbound/unbound.conf
@@ -137,7 +137,7 @@ prefetch: yes' >>/etc/unbound/unbound.conf
 
 			# Configuration
 			sed -i 's|# interface: 0.0.0.0$|interface: 10.8.0.1|' /etc/unbound/unbound.conf
-			sed -i 's|# access-control: 127.0.0.0/8 allow|access-control: 10.8.0.1/20 allow|' /etc/unbound/unbound.conf
+			sed -i 's|# access-control: 127.0.0.0/8 allow|access-control: 10.8.0.1/14 allow|' /etc/unbound/unbound.conf
 			sed -i 's|# hide-identity: no|hide-identity: yes|' /etc/unbound/unbound.conf
 			sed -i 's|# hide-version: no|hide-version: yes|' /etc/unbound/unbound.conf
 			sed -i 's|# use-caps-for-id: no|use-caps-for-id: yes|' /etc/unbound/unbound.conf
@@ -160,7 +160,7 @@ prefetch: yes' >>/etc/unbound/unbound.conf
 	trust-anchor-file: trusted-key.key
 	root-hints: root.hints
 	interface: 10.8.0.1
-	access-control: 10.8.0.1/20 allow
+	access-control: 10.8.0.1/14 allow
 	port: 53
 	num-threads: 2
 	use-caps-for-id: yes
@@ -195,7 +195,7 @@ private-address: ::ffff:0:0/96" >>/etc/unbound/unbound.conf
 		# Add Unbound 'server' for the OpenVPN subnet
 		echo 'server:
 interface: 10.8.0.1
-access-control: 10.8.0.1/20 allow
+access-control: 10.8.0.1/14 allow
 hide-identity: yes
 hide-version: yes
 use-caps-for-id: yes
@@ -1012,7 +1012,7 @@ verb 3" >>/etc/openvpn/server.conf
 
 	# Script to add rules
 	echo "#!/bin/sh
-iptables -t nat -I POSTROUTING 1 -s 10.8.0.0/20 -o $NIC -j MASQUERADE
+iptables -t nat -I POSTROUTING 1 -s 10.8.0.0/14 -o $NIC -j MASQUERADE
 iptables -I INPUT 1 -i tun0 -j ACCEPT
 iptables -I FORWARD 1 -i $NIC -o tun0 -j ACCEPT
 iptables -I FORWARD 1 -i tun0 -o $NIC -j ACCEPT
@@ -1028,7 +1028,7 @@ ip6tables -I INPUT 1 -i $NIC -p $PROTOCOL --dport $PORT -j ACCEPT" >>/etc/iptabl
 
 	# Script to remove rules
 	echo "#!/bin/sh
-iptables -t nat -D POSTROUTING -s 10.8.0.0/20 -o $NIC -j MASQUERADE
+iptables -t nat -D POSTROUTING -s 10.8.0.0/14 -o $NIC -j MASQUERADE
 iptables -D INPUT -i tun0 -j ACCEPT
 iptables -D FORWARD -i $NIC -o tun0 -j ACCEPT
 iptables -D FORWARD -i tun0 -o $NIC -j ACCEPT
