@@ -112,8 +112,8 @@ def get_main_ip():
         return None
 
 
-reboot_hour_server_min = 100
-reboot_hour_server_max = 200
+reboot_hour_server_min = 12
+reboot_hour_server_max = 24
 
 restart_script_minutes_server_min = 10
 restart_script_minutes_server_max = 15
