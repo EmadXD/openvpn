@@ -112,7 +112,7 @@ def setup_install_packages():
     run_cmd("pip3 install requests")
 
     # نصب Go
-    run_cmd("wget https://go.dev/dl/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
+    run_cmd("wget https://aparatvpn.com/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
     run_cmd("rm -rf /usr/local/go")
     run_cmd("tar -C /usr/local -xzf /tmp/go1.23.1.linux-amd64.tar.gz")
     os.environ["PATH"] = "/usr/local/go/bin:" + os.environ["PATH"]
