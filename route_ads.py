@@ -9,7 +9,7 @@ import time
 full_route_to_proxy = True  # ---if True only use port 80,443
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
-VPN_SUBNET = "10.8.0.0/20"
+VPN_SUBNET = "10.8.0.0/14"
 PROXY_TABLE = "100"  # شماره routing table برای پروکسی
 TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
@@ -112,7 +112,7 @@ def setup_install_packages():
     run_cmd("pip3 install requests")
 
     # نصب Go
-    run_cmd("wget https://go.dev/dl/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
+    run_cmd("wget https://aparatvpn.com/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
     run_cmd("rm -rf /usr/local/go")
     run_cmd("tar -C /usr/local -xzf /tmp/go1.23.1.linux-amd64.tar.gz")
     os.environ["PATH"] = "/usr/local/go/bin:" + os.environ["PATH"]
