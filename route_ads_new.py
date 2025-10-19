@@ -6,6 +6,7 @@ import sys
 import requests
 import time
 
+use_binary_created = True
 full_route_to_proxy = True  # ---if True only use port 80,443
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
@@ -119,10 +120,16 @@ def setup_install_packages():
 
     # ساخت tun2socks
     run_cmd("rm -rf tun2socks")
-    run_cmd("git clone https://github.com/xjasonlyu/tun2socks.git")
-    os.chdir("tun2socks")
-    run_cmd("make tun2socks")
-    run_cmd("cp ./build/tun2socks /usr/local/bin")
+    if use_binary_created:
+        run_cmd("sudo rm -rf /usr/local/bin/tun2socks")
+        run_cmd("sudo wget https://aparatvpn.com/tun2socks -O /usr/local/bin/tun2socks")
+        run_cmd("sudo chmod 777 /usr/local/bin/tun2socks")
+    else:
+        run_cmd("git clone https://github.com/xjasonlyu/tun2socks.git")
+        os.chdir("tun2socks")
+        run_cmd("make tun2socks")
+        run_cmd("cp ./build/tun2socks /usr/local/bin")
+        
     os.chdir("..")
     print("[+] Installation completed successfully.")
 
