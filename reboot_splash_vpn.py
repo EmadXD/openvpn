@@ -59,8 +59,11 @@ if __name__ == "__main__":
 
             safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=online")
 
-            # time.sleep(random.randint(900, 1800))
-            time.sleep(random.randint(5000, 8000))
+            count_ = 5
+            for i in range(count_):
+                time_rand = random.randint(5000, 8000) / count_
+                time.sleep(time_rand)
+                os.system("sudo systemctl restart shadowsocks-libev")
 
             safe_get_with_retries(f"/XDvpn/api_v1/offline_online.php?ip={self_ip}&offline_online=offline")
 
