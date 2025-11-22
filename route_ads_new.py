@@ -92,12 +92,12 @@ def run_cmd(cmd):
 
 # ---------------- Install Packages ----------------
 def setup_install_packages():
-    tun2socks_installed = os.path.exists("/usr/local/bin/tun2socks") or \
-                          subprocess.run("which tun2socks", shell=True, capture_output=True).returncode == 0
-
-    if tun2socks_installed:
-        print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
-        return
+    # tun2socks_installed = os.path.exists("/usr/local/bin/tun2socks") or \
+    #                       subprocess.run("which tun2socks", shell=True, capture_output=True).returncode == 0
+    # 
+    # if tun2socks_installed:
+    #     print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
+    #     return
 
     print("[+] Installing required packages and building tun2socks...")
     run_cmd("sudo apt update")
