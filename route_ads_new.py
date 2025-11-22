@@ -7,7 +7,7 @@ import requests
 import time
 
 use_binary_created = True
-full_route_to_proxy = False  # ---if True only use port 80,443
+full_route_to_proxy = True  # ---if True only use port 80,443
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
 VPN_SUBNET = "10.8.0.0/14"
