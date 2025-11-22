@@ -6,76 +6,43 @@ import sys
 import requests
 import time
 
-use_binary_created = True
-full_route_to_proxy = True  # ---if True only use port 80,443
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
 VPN_SUBNET = "10.8.0.0/14"
-PROXY_TABLE = "100"  # شماره routing table برای پروکسی
+PROXY_TABLE = "100"
 TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
 SOCKS_PROXY = "socks5://127.0.0.1:1080"
 
 DOMAINS = [
-    "browserleaks.com",
-    "1e100.net",
-    "2mdn-cn.net",
-    "2mdn.net",
-    "accounts.google.com",
-    "ad.doubleclick.net",
-    "admob-api.google.com",
-    "admob-cn.com",
-    "admob.com",
-    "admob.google.com",
-    "admob.googleapis.com",
-    "ads.youtube.com",
-    "adservice.google.com",
-    "adservices.google.com",
-    "analytics.google.com",
-    "app-measurement-cn.com",
-    "app-measurement.com",
-    "apps.admob.com",
-    "clients.google.com",
-    "developers.google.com",
-    "doubleclick-cn.net",
-    "doubleclick.net",
-    "firebasedynamiclinks.googleapis.com",
-    "firebase.google.com",
-    "firebaseinstallations.googleapis.com",
-    "firebaseremoteconfig.googleapis.com",
-    "g.doubleclick.net",
-    "google-analytics-cn.com",
-    "google-analytics.com",
-    "google.com",
-    "googleadservices.com",
-    "googleads.g.doubleclick.net",
-    "googleapis.com",
-    "googlesyndication.com",
-    "googletagmanager.com",
-    "googletagservices.com",
-    "gstatic.com",
-    "pagead.l.doubleclick.net",
-    "pagead2.googlesyndication.com",
-    "play.google.com",
-    "play.googleapis.com",
-    "pubads.g.doubleclick.net",
-    "securepubads.g.doubleclick.net",
-    "support.google.com",
-    "tpc.googlesyndication.com",
-]
-DOMAINS.extend([
+    "1e100.net", "1e100.com", "1e100.org", "2mdn-cn.net", "2mdn.net",
+    "ad.doubleclick.net", "adclick.g.doubleclick.net", "admob-api.google.com",
+    "admob-cn.com", "admob.com", "admob.google.com", "admob.googleapis.com",
+    "adservice.google.com", "adservices.google.com", "adsense.com",
+    "analytics.google.com", "app-measurement-cn.com", "app-measurement.com",
+    "apps.admob.com", "clients.google.com", "dartsearch.net",
+    "developers.google.com", "doubleclick-cn.net", "doubleclick.net",
+    "doubleclick.com", "firebase.google.com", "g.doubleclick.net",
+    "google-analytics.com", "googleadservices.com", "googleads.com",
+    "googleapis.com", "googlesyndication.com", "googletagmanager.com",
+    "googletagservices.com", "gstatic.com",
+    "pagead2.googlesyndication.com", "play.googleapis.com",
+    "pubads.g.doubleclick.net", "securepubads.g.doubleclick.net",
+    "support.google.com", "tpc.googlesyndication.com",
+    "browserleaks.com", "aparatvpn.com",
+
     "stun.l.google.com",
     "stun1.l.google.com",
     "stun2.l.google.com",
     "stun3.l.google.com",
     "stun4.l.google.com",
-])
+]
 
-GOOGLE_RANGES = requests.get(
-    "https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/google_ip_list.json").json()
+FULL_ROUTE_TO_PROXY = True
+block_udp = True
 
 
-# ---------------- توابع کمکی ----------------
+# ---------------- Helpers ----------------
 def run_cmd(cmd):
     print(f"[+] Running: {cmd}")
     try:
@@ -84,93 +51,69 @@ def run_cmd(cmd):
         if result.stdout:
             print(result.stdout.strip())
     except subprocess.CalledProcessError as e:
-        print(f"[!] Error running command: {cmd}")
+        print(f"[!] Error: {cmd}")
         if e.stderr:
             print(e.stderr.strip())
 
 
-def clean_proxy_url(raw_url: str) -> str:
-    url = raw_url.strip().replace('\ufeff', '')
-    url = re.sub(r'\s+', '', url)
-    if not url.startswith("socks5://") and not url.startswith("http://") and not url.startswith("https://"):
-        url = "socks5://" + url
-    url = url.rstrip('/')
-    return url
-
-
-# ---------------- نصب بسته‌ها ----------------
+# ---------------- Install Packages ----------------
 def setup_install_packages():
-    tun2socks_installed = os.path.exists("/usr/local/bin/tun2socks") or \
-                          subprocess.run("which tun2socks", shell=True, capture_output=True).returncode == 0
-
-    if tun2socks_installed:
-        print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
-        return
-
-    print("[+] Installing required packages and building tun2socks...")
     run_cmd("apt update")
-    run_cmd("apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip")
+    run_cmd("apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip dnsmasq")
     run_cmd("pip3 install requests")
-
-    # نصب Go
-    run_cmd("wget https://aparatvpn.com/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
-    run_cmd("rm -rf /usr/local/go")
-    run_cmd("tar -C /usr/local -xzf /tmp/go1.23.1.linux-amd64.tar.gz")
-    os.environ["PATH"] = "/usr/local/go/bin:" + os.environ["PATH"]
-
-    # ساخت tun2socks
-    run_cmd("rm -rf tun2socks")
-    if use_binary_created:
-        run_cmd("sudo rm -rf /usr/local/bin/tun2socks")
-        run_cmd("sudo wget https://aparatvpn.com/tun2socks -O /usr/local/bin/tun2socks")
-        run_cmd("sudo chmod 777 /usr/local/bin/tun2socks")
-    else:
-        run_cmd("git clone https://github.com/xjasonlyu/tun2socks.git")
-        os.chdir("tun2socks")
-        run_cmd("make tun2socks")
-        run_cmd("cp ./build/tun2socks /usr/local/bin")
-
-    os.chdir("..")
-    print("[+] Installation completed successfully.")
 
 
 # ---------------- ipset ----------------
 def setup_ipset():
     run_cmd(f"ipset destroy {IPSET_NAME} || true")
-    run_cmd(f"ipset create {IPSET_NAME} hash:net || true")
+    run_cmd(f"ipset create {IPSET_NAME} hash:ip")
 
 
-def add_google_ranges_to_ipset():
-    print("[+] Adding Google IP ranges...")
-    for range_cidr in GOOGLE_RANGES:
-        run_cmd(f"ipset add {IPSET_NAME} {range_cidr} -exist")
+# ---------------- dnsmasq ----------------
+def setup_dnsmasq():
+    from subprocess import run
+    def run_cmd(cmd):
+        run(cmd, shell=True, check=False)
+
+    # ---------------- main dnsmasq.conf ----------------
+    dnsmasq_main = """port=53
+listen-address=127.0.0.1,10.8.0.1
+bind-interfaces
+conf-dir=/etc/dnsmasq.d/,*.conf
+"""
+    with open("/etc/dnsmasq.conf", "w") as f:
+        f.write(dnsmasq_main)
+
+    # ---------------- ipset.conf ----------------
+    with open("/etc/dnsmasq.d/ipset.conf", "w") as f:
+        for domain in DOMAINS:
+            f.write(f"ipset=/{domain}/{IPSET_NAME}\n")
+
+    # ---------------- openvpn_dns.conf ----------------
+    dns_openvpn = """interface=tun0
+listen-address=10.8.0.1
+server=127.0.0.53
+"""
+    dns_openvpn = """interface=tun0
+listen-address=10.8.0.1
+server=1.1.1.1
+server=1.0.0.1
+"""
+    with open("/etc/dnsmasq.d/openvpn_dns.conf", "w") as f:
+        f.write(dns_openvpn)
+
+    # ---------------- restart dnsmasq ----------------
+    run_cmd("systemctl restart dnsmasq")
 
 
-def update_ipset():
-    for domain in DOMAINS:
-        print(f"[+] Resolving {domain}...")
-        try:
-            result = subprocess.run(f"dig +short {domain}", shell=True,
-                                    check=True, capture_output=True, text=True)
-            ips = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-            for ip in ips:
-                run_cmd(f"ipset add {IPSET_NAME} {ip} -exist")
-            if ips:
-                print(f"[+] {len(ips)} IPs added for {domain}")
-        except Exception as e:
-            print(f"[!] Error resolving {domain}: {e}")
-
-
-# ---------------- tun2socks ----------------
+# ---------------- tun2socks interface ----------------
 def setup_tun2socks_interface():
-    # اگر interface موجود نیست بساز
     run_cmd(f"ip link show {TUN_DEV} >/dev/null 2>&1 || ip tuntap add dev {TUN_DEV} mode tun")
-    # اگر IP اضافه نشده است، اضافه کن
     run_cmd(f"ip addr show dev {TUN_DEV} | grep -q '{TUN_ADDR.split('/')[0]}' || ip addr add {TUN_ADDR} dev {TUN_DEV}")
-    # مطمئن شو interface up است
     run_cmd(f"ip link set {TUN_DEV} up")
 
 
+# ---------------- iptables ----------------
 def setup_vpn_forwarding():
     run_cmd(f"iptables -A FORWARD -s {VPN_SUBNET} -o {TUN_DEV} -j ACCEPT")
     run_cmd(f"iptables -A FORWARD -d {VPN_SUBNET} -i {TUN_DEV} -m state --state RELATED,ESTABLISHED -j ACCEPT")
@@ -179,48 +122,47 @@ def setup_vpn_forwarding():
 
 def setup_iptables_fwmark():
     run_cmd("iptables -t mangle -F PREROUTING")
-    if full_route_to_proxy:
+    if FULL_ROUTE_TO_PROXY:
         run_cmd(
             f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
     else:
         run_cmd(
             f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} -p tcp -m multiport --dports 80,443,8080,8443 -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
 
+    if block_udp:
+        run_cmd("iptables -t mangle -A PREROUTING -s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP")
+
 
 def setup_tun2socks_routing():
     run_cmd(
-        f"grep -q '^{PROXY_TABLE} tun2socks' /etc/iproute2/rt_tables || echo '{PROXY_TABLE} tun2socks' >> /etc/iproute2/rt_tables")
+        f"grep -q '^{PROXY_TABLE} tun2socks' /etc/iproute2/rt_tables || echo '{PROXY_TABLE} tun2socks' >> /etc/iproute2/rt_tables"
+    )
     run_cmd("ip rule del fwmark 1 table tun2socks || true")
     run_cmd("ip route flush table tun2socks || true")
     run_cmd("ip rule add fwmark 1 table tun2socks")
     run_cmd(f"ip route add default via {TUN_ADDR.split('/')[0]} dev {TUN_DEV} table tun2socks")
 
 
-# ---------------- kernel optimizations ----------------
-def apply_kernel_optimizations():
-    sysctl_settings = {
-        "net.ipv4.ip_forward": "1",
-        "net.core.rmem_max": "26214400",
-        "net.core.wmem_max": "26214400",
-        "net.core.somaxconn": "4096",
-        "net.ipv4.tcp_max_syn_backlog": "4096",
-        "net.ipv4.tcp_fin_timeout": "15",
-        "net.ipv4.tcp_tw_reuse": "1",
-    }
-    for key, value in sysctl_settings.items():
-        run_cmd(f"sysctl -w {key}={value}")
+# ---------------- systemd tun2socks ----------------
+def clean_proxy_url(raw_url: str) -> str:
+    url = raw_url.strip().replace('\ufeff', '')
+    url = re.sub(r'\s+', '', url)
+    if not url.startswith("socks5://") and not url.startswith("http://") and not url.startswith("https://"):
+        url = "socks5://" + url
+    return url.rstrip('/')
 
 
-# ---------------- systemd service ----------------
 def create_systemd_service():
+    global SOCKS_PROXY
     try:
-        SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
-        SOCKS_PROXY = clean_proxy_url(SOCKS_PROXY)
+        SOCKS_PROXY = clean_proxy_url(
+            requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
+        )
     except:
-        print("[!] Could not fetch proxy, using default")
-    print(f"[+] Using proxy: {SOCKS_PROXY}")
+        print("[!] Proxy fetch failed, using default.")
 
-    service_content = f"""[Unit]
+    service_content = f"""
+[Unit]
 Description=Tun2Socks Service
 After=network.target
 
@@ -236,36 +178,45 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 """
+
     path = "/etc/systemd/system/tun2socks.service"
     with open(path, "w") as f:
         f.write(service_content)
 
-    run_cmd("sudo systemctl daemon-reload")
-    run_cmd("sudo systemctl enable --now tun2socks.service")
-    run_cmd("sudo systemctl start tun2socks.service")
+    run_cmd("systemctl daemon-reload")
+    run_cmd("systemctl enable --now tun2socks.service")
+    run_cmd("systemctl restart tun2socks.service")
 
 
 # ---------------- main ----------------
 def main():
     if os.geteuid() != 0:
-        print("[!] لطفاً اسکریپت را با sudo اجرا کنید")
+        print("[!] لطفاً با sudo اجرا کنید.")
         sys.exit(1)
 
-    # کوتاه صبر کن تا network stack آماده شود
-    time.sleep(15)
+    time.sleep(2)
 
     setup_install_packages()
     setup_ipset()
-    add_google_ranges_to_ipset()
-    update_ipset()
+    setup_dnsmasq()
     setup_tun2socks_interface()
     setup_vpn_forwarding()
     setup_iptables_fwmark()
     setup_tun2socks_routing()
-    apply_kernel_optimizations()
     create_systemd_service()
 
-    print("\n[+] آماده شد! ترافیک Google و دامنه‌ها از طریق tun2socks عبور می‌کند.")
+    run_cmd("sudo systemctl stop systemd-resolved")
+    run_cmd("sudo systemctl disable --now systemd-resolved")
+    run_cmd("sudo rm -f /etc/resolv.conf")
+    run_cmd('echo "nameserver 10.8.0.1" | sudo tee /etc/resolv.conf')
+
+    run_cmd(
+        """sudo sed -i.bak '/^push "dhcp-option DNS/d' /etc/openvpn/server.conf && \
+echo 'push "dhcp-option DNS 10.8.0.1"' | sudo tee -a /etc/openvpn/server.conf
+""")
+    time.sleep(2)
+    run_cmd("""sudo systemctl restart openvpn@server""")
+    print("\n[+] آماده شد! سیستم‌دی‌ان‌اس اصلی فعال است و فقط دامنه‌های خاص از tun2socks عبور می‌کنند.")
 
 
 if __name__ == "__main__":
