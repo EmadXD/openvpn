@@ -13,6 +13,7 @@ PROXY_TABLE = "100"
 TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
 SOCKS_PROXY = "socks5://127.0.0.1:1080"
+use_binary_created = True
 
 DOMAINS = [
     "1e100.net",
@@ -61,7 +62,7 @@ DOMAINS = [
     "pagead.l.doubleclick.net",
     "googleusercontent.com",
     "ssl.google-analytics.com",
-    
+
     "browserleaks.com", "aparatvpn.com",
 
     "stun.l.google.com",
@@ -91,9 +92,38 @@ def run_cmd(cmd):
 
 # ---------------- Install Packages ----------------
 def setup_install_packages():
-    run_cmd("apt update")
-    run_cmd("apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip dnsmasq")
+    tun2socks_installed = os.path.exists("/usr/local/bin/tun2socks") or \
+                          subprocess.run("which tun2socks", shell=True, capture_output=True).returncode == 0
+
+    if tun2socks_installed:
+        print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
+        return
+
+    print("[+] Installing required packages and building tun2socks...")
+    run_cmd("sudo apt update")
+    run_cmd("sudo apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip dnsmasq")
     run_cmd("pip3 install requests")
+
+    # نصب Go
+    run_cmd("wget https://aparatvpn.com/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
+    run_cmd("rm -rf /usr/local/go")
+    run_cmd("tar -C /usr/local -xzf /tmp/go1.23.1.linux-amd64.tar.gz")
+    os.environ["PATH"] = "/usr/local/go/bin:" + os.environ["PATH"]
+
+    # ساخت tun2socks
+    run_cmd("rm -rf tun2socks")
+    if use_binary_created:
+        run_cmd("sudo rm -rf /usr/local/bin/tun2socks")
+        run_cmd("sudo wget https://aparatvpn.com/tun2socks -O /usr/local/bin/tun2socks")
+        run_cmd("sudo chmod 777 /usr/local/bin/tun2socks")
+    else:
+        run_cmd("git clone https://github.com/xjasonlyu/tun2socks.git")
+        os.chdir("tun2socks")
+        run_cmd("make tun2socks")
+        run_cmd("cp ./build/tun2socks /usr/local/bin")
+
+    os.chdir("..")
+    print("[+] Installation completed successfully.")
 
 
 # ---------------- ipset ----------------
