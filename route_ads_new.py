@@ -92,12 +92,11 @@ def run_cmd(cmd):
 
 # ---------------- Install Packages ----------------
 def setup_install_packages():
-    # tun2socks_installed = os.path.exists("/usr/local/bin/tun2socks") or \
-    #                       subprocess.run("which tun2socks", shell=True, capture_output=True).returncode == 0
-    # 
-    # if tun2socks_installed:
-    #     print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
-    #     return
+    tun2socks_installed = os.path.exists("/opt/tun2socks")
+
+    if tun2socks_installed:
+        print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
+        return
 
     print("[+] Installing required packages and building tun2socks...")
     run_cmd("sudo apt update")
@@ -113,9 +112,10 @@ def setup_install_packages():
     # ساخت tun2socks
     run_cmd("rm -rf tun2socks")
     if use_binary_created:
-        run_cmd("sudo rm -rf /usr/local/bin/tun2socks")
-        run_cmd("sudo wget https://aparatvpn.com/tun2socks -O /usr/local/bin/tun2socks")
-        run_cmd("sudo chmod 777 /usr/local/bin/tun2socks")
+        run_cmd("sudo mkdir -p /opt/tun2socks")
+        run_cmd("sudo rm -rf /opt/tun2socks")
+        run_cmd("sudo wget https://aparatvpn.com/tun2socks -O /opt/tun2socks")
+        run_cmd("sudo chmod 777 /opt/tun2socks")
     else:
         run_cmd("git clone https://github.com/xjasonlyu/tun2socks.git")
         os.chdir("tun2socks")
@@ -234,7 +234,7 @@ Type=simple
 ExecStartPre=/bin/bash -c 'ip link show {TUN_DEV} >/dev/null 2>&1 || ip tuntap add dev {TUN_DEV} mode tun'
 ExecStartPre=/bin/bash -c 'ip addr show dev {TUN_DEV} | grep -q "{TUN_ADDR.split("/")[0]}" || ip addr add {TUN_ADDR} dev {TUN_DEV}'
 ExecStartPre=/sbin/ip link set {TUN_DEV} up
-ExecStart=/usr/local/bin/tun2socks -device {TUN_DEV} -proxy {SOCKS_PROXY} -loglevel error
+ExecStart=/opt/tun2socks -device {TUN_DEV} -proxy {SOCKS_PROXY} -loglevel error
 Restart=always
 RestartSec=3
 
