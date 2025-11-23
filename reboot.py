@@ -52,7 +52,7 @@ Type=simple
 ExecStartPre=/bin/bash -c 'ip link show {TUN_DEV} >/dev/null 2>&1 || ip tuntap add dev {TUN_DEV} mode tun'
 ExecStartPre=/bin/bash -c 'ip addr show dev {TUN_DEV} | grep -q "{TUN_ADDR.split("/")[0]}" || ip addr add {TUN_ADDR} dev {TUN_DEV}'
 ExecStartPre=/sbin/ip link set {TUN_DEV} up
-ExecStart=/usr/local/bin/tun2socks -device {TUN_DEV} -proxy {SOCKS_PROXY} -loglevel error
+ExecStart=/opt/tun2socks -device {TUN_DEV} -proxy {SOCKS_PROXY} -loglevel error
 Restart=always
 RestartSec=3
 
