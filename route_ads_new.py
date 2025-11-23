@@ -92,9 +92,12 @@ def run_cmd(cmd):
 
 # ---------------- Install Packages ----------------
 def setup_install_packages():
-    tun2socks_installed = os.path.exists("/opt/tun2socks")
+    tun2socks_path = "/opt/tun2socks"
 
-    if tun2socks_installed:
+    tun2socks_installed = os.path.exists(tun2socks_path)
+    tun2socks_size = os.path.getsize(tun2socks_path) if tun2socks_installed else 0
+
+    if tun2socks_installed and tun2socks_size > 0:
         print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
         return
 
@@ -112,7 +115,7 @@ def setup_install_packages():
     # ساخت tun2socks
     run_cmd("rm -rf tun2socks")
     if use_binary_created:
-        run_cmd("sudo mkdir -p /opt/tun2socks")
+        run_cmd("sudo mkdir -p /opt/")
         run_cmd("sudo rm -rf /opt/tun2socks")
         run_cmd("sudo wget https://aparatvpn.com/tun2socks -O /opt/tun2socks")
         run_cmd("sudo chmod 777 /opt/tun2socks")
@@ -284,6 +287,7 @@ echo 'push "dhcp-option DNS 10.8.0.1"' | sudo tee -a /etc/openvpn/server.conf
 
 if __name__ == "__main__":
     try:
+        time.sleep(10)
         main()
         time.sleep(90000000)
     except KeyboardInterrupt:
