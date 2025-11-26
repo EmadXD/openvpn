@@ -90,14 +90,41 @@ def run_cmd(cmd):
             print(e.stderr.strip())
 
 
+def run_cmd_return(cmd):
+    print(f"[+] Running: {cmd}")
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        output = result.stdout if result.stdout else ""
+        print(output, end="")  # نشان دادن در ترمینال
+        return output  # برگرداندن همان خروجی
+
+    except subprocess.CalledProcessError as e:
+        error = e.stderr if e.stderr else ""
+        print(error, end="")  # چاپ مثل ترمینال
+        return error  # برگرداندن همان متن خطا
+
+
 # ---------------- Install Packages ----------------
 def setup_install_packages():
-    tun2socks_path = "/opt/tun2socks"
-
-    tun2socks_installed = os.path.exists(tun2socks_path)
-    tun2socks_size = os.path.getsize(tun2socks_path) if tun2socks_installed else 0
-
-    if tun2socks_installed and tun2socks_size > 0:
+    # tun2socks_path = "/opt/tun2socks"
+    #
+    # tun2socks_installed = os.path.exists(tun2socks_path)
+    # tun2socks_size = os.path.getsize(tun2socks_path) if tun2socks_installed else 0
+    #
+    # if tun2socks_installed and tun2socks_size > 0:
+    #     print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
+    #     return
+    run_cmd(
+        "sudo wget https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/test_tun2socks.sh -O /opt/test_tun2socks.sh")
+    run_cmd("sudo chmod 777 /opt/test_tun2socks.sh")
+    result = run_cmd_return("sudo /opt/test_tun2socks.sh /opt/tun2socks")
+    if "true" in result:
         print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
         return
 
