@@ -151,7 +151,18 @@ def setup_install_packages():
         run_cmd("cp ./build/tun2socks /usr/local/bin")
 
     os.chdir("..")
-    print("[+] Installation completed successfully.")
+    # -------------
+    tun2socks_installed = os.path.exists(tun2socks_path)
+    if tun2socks_installed:
+        size_bytes = os.path.getsize(tun2socks_path)
+        size_mb = size_bytes / (1024 * 1024)
+    else:
+        size_mb = 0
+
+    if size_mb < 11:
+        setup_install_packages()
+    else:
+        print("[+] Installation completed successfully.")
 
 
 # ---------------- ipset ----------------
