@@ -127,8 +127,6 @@ def setup_install_packages():
         return
 
     print("[+] Installing required packages and building tun2socks...")
-    run_cmd("sudo apt update")
-    run_cmd("sudo apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip dnsmasq")
     run_cmd("pip3 install requests")
 
     # نصب Go
@@ -298,7 +296,7 @@ def main():
 
     time.sleep(2)
     # ------------
-    if os.path.exists("/etc/dnsmasq.conf"):
+    if os.path.exists("/etc/dnsmasq.d/openvpn_dns.conf"):
         run_cmd("sudo systemctl stop systemd-resolved")
         run_cmd("sudo systemctl disable --now systemd-resolved")
         run_cmd("sudo rm -f /etc/resolv.conf")
@@ -309,10 +307,15 @@ def main():
         run_cmd("sudo systemctl enable dnsmasq")
         time.sleep(2)
     # ------------
+    run_cmd("sudo apt update")
+    run_cmd("sudo apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip dnsmasq")
+    setup_dnsmasq()
+
+    run_cmd("sudo apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip dnsmasq")
+    setup_dnsmasq()
 
     setup_install_packages()
     setup_ipset()
-    setup_dnsmasq()
     setup_tun2socks_interface()
     setup_vpn_forwarding()
     setup_iptables_fwmark()
