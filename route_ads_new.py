@@ -122,7 +122,7 @@ def setup_install_packages():
     else:
         size_mb = 0
 
-    if size_mb >= 11:
+    if size_mb >= 10:
         print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
         return
 
@@ -158,7 +158,8 @@ def setup_install_packages():
     else:
         size_mb = 0
 
-    if size_mb < 11:
+    if size_mb < 10:
+        print(f"[-] size error: {size_mb}")
         setup_install_packages()
     else:
         print("[+] Installation completed successfully.")
