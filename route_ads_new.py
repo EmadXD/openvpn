@@ -138,20 +138,19 @@ def setup_install_packages():
     os.environ["PATH"] = "/usr/local/go/bin:" + os.environ["PATH"]
 
     # ساخت tun2socks
-    run_cmd("rm -rf tun2socks")
     if use_binary_created:
         run_cmd("sudo mkdir -p /opt/")
         run_cmd("sudo rm -rf /opt/tun2socks")
         run_cmd("sudo wget https://aparatvpn.com/tun2socks -O /opt/tun2socks")
         run_cmd("sudo chmod 777 /opt/tun2socks")
     else:
+        run_cmd("rm -rf tun2socks")
         run_cmd("git clone https://github.com/xjasonlyu/tun2socks.git")
         os.chdir("tun2socks")
         run_cmd("make tun2socks")
         run_cmd("cp ./build/tun2socks /usr/local/bin")
-
-    os.chdir("..")
-    # -------------
+        os.chdir("..")
+    # ------------- check again
     tun2socks_installed = os.path.exists(tun2socks_path)
     if tun2socks_installed:
         size_bytes = os.path.getsize(tun2socks_path)
