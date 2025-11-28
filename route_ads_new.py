@@ -112,33 +112,17 @@ def run_cmd_return(cmd):
 
 # ---------------- Install Packages ----------------
 def setup_install_packages():
-    # tun2socks_path = "/opt/tun2socks"
-    #
-    # tun2socks_installed = os.path.exists(tun2socks_path)
-    # tun2socks_size = os.path.getsize(tun2socks_path) if tun2socks_installed else 0
-    #
-    # if tun2socks_installed and tun2socks_size > 0:
-    #     print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
-    #     return
-    cmd = r"""sudo tee /opt/test_tun2socks.sh > /dev/null << 'EOF'
-#!/usr/bin/env bash
+    tun2socks_path = "/opt/tun2socks"
 
-BIN="$1"
+    tun2socks_installed = os.path.exists(tun2socks_path)
 
-[[ -f "$BIN" ]] || { echo false; exit; }
-[[ -x "$BIN" ]] || { echo false; exit; }
+    if tun2socks_installed:
+        size_bytes = os.path.getsize(tun2socks_path)
+        size_mb = size_bytes / (1024 * 1024)
+    else:
+        size_mb = 0
 
-if "$BIN" --help >/dev/null 2>&1 || "$BIN" --version >/dev/null 2>&1; then
-    echo true
-else
-    echo false
-fi
-EOF
-"""
-    run_cmd(cmd)
-    run_cmd("sudo chmod 777 /opt/test_tun2socks.sh")
-    result = run_cmd_return("sudo /opt/test_tun2socks.sh /opt/tun2socks")
-    if "true" in result:
+    if size_mb >= 11:
         print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
         return
 
