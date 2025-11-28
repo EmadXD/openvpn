@@ -120,8 +120,22 @@ def setup_install_packages():
     # if tun2socks_installed and tun2socks_size > 0:
     #     print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
     #     return
-    run_cmd(
-        "sudo wget https://raw.githubusercontent.com/EmadXD/openvpn/refs/heads/main/test_tun2socks.sh -O /opt/test_tun2socks.sh")
+    cmd = r"""sudo tee /opt/test_tun2socks.sh > /dev/null << 'EOF'
+#!/usr/bin/env bash
+
+BIN="$1"
+
+[[ -f "$BIN" ]] || { echo false; exit; }
+[[ -x "$BIN" ]] || { echo false; exit; }
+
+if "$BIN" --help >/dev/null 2>&1 || "$BIN" --version >/dev/null 2>&1; then
+    echo true
+else
+    echo false
+fi
+EOF
+"""
+    run_cmd(cmd)
     run_cmd("sudo chmod 777 /opt/test_tun2socks.sh")
     result = run_cmd_return("sudo /opt/test_tun2socks.sh /opt/tun2socks")
     if "true" in result:
