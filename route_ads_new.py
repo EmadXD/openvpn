@@ -297,6 +297,17 @@ def main():
 
     time.sleep(2)
 
+    run_cmd("sudo systemctl stop systemd-resolved")
+    run_cmd("sudo systemctl disable --now systemd-resolved")
+    run_cmd("sudo rm -f /etc/resolv.conf")
+    run_cmd('echo "nameserver 10.8.0.1" | sudo tee /etc/resolv.conf')
+
+    run_cmd("sudo systemctl start dnsmasq")
+    time.sleep(2)
+    run_cmd("sudo systemctl enable dnsmasq")
+    time.sleep(2)
+    # run_cmd("""sudo bash -c 'echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf'""")
+
     setup_install_packages()
     setup_ipset()
     setup_dnsmasq()
@@ -305,11 +316,6 @@ def main():
     setup_iptables_fwmark()
     setup_tun2socks_routing()
     create_systemd_service()
-
-    run_cmd("sudo systemctl stop systemd-resolved")
-    run_cmd("sudo systemctl disable --now systemd-resolved")
-    run_cmd("sudo rm -f /etc/resolv.conf")
-    run_cmd('echo "nameserver 10.8.0.1" | sudo tee /etc/resolv.conf')
 
     run_cmd(
         """sudo sed -i.bak '/^push "dhcp-option DNS/d' /etc/openvpn/server.conf && \
