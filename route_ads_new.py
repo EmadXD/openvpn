@@ -256,7 +256,7 @@ def create_systemd_service():
     global SOCKS_PROXY
     try:
         SOCKS_PROXY = clean_proxy_url(
-            requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
+            requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX").text
         )
     except:
         print("[!] Proxy fetch failed, using default.")
