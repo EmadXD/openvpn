@@ -37,7 +37,7 @@ TUN_ADDR = "192.168.255.1/24"
 
 def create_systemd_service():
     try:
-        SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php").text
+        SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX").text
         SOCKS_PROXY = clean_proxy_url(SOCKS_PROXY)
     except:
         print("[!] Could not fetch proxy, using default")
