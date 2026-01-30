@@ -15,6 +15,8 @@ TUN_ADDR = "192.168.255.1/24"
 SOCKS_PROXY = "socks5://127.0.0.1:1080"
 use_binary_created = True
 
+split_chain = True
+
 DOMAINS = [
     "1e100.net",
     "1e100.com",
@@ -233,6 +235,26 @@ def setup_iptables_fwmark():
         run_cmd("iptables -t mangle -A PREROUTING -s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP")
 
 
+def setup_iptables_fwmark_split():
+    # ساخت chain امن TUN2SOCKS (اگر وجود نداشته باشد)
+    run_cmd("iptables -t mangle -N TUN2SOCKS 2>/dev/null || true")
+    run_cmd("iptables -t mangle -A PREROUTING -j TUN2SOCKS")
+
+    # flush کردن فقط قوانین قبلی داخل chain TUN2SOCKS
+    run_cmd("iptables -t mangle -F TUN2SOCKS")
+
+    # اضافه کردن قوانین فقط به chain TUN2SOCKS
+    if FULL_ROUTE_TO_PROXY:
+        run_cmd(
+            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+    else:
+        run_cmd(
+            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -p tcp -m multiport --dports 80,443,8080,8443 -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+
+    if block_udp:
+        run_cmd("iptables -t mangle -A TUN2SOCKS -s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP")
+
+
 def setup_tun2socks_routing():
     run_cmd(
         f"grep -q '^{PROXY_TABLE} tun2socks' /etc/iproute2/rt_tables || echo '{PROXY_TABLE} tun2socks' >> /etc/iproute2/rt_tables"
@@ -318,7 +340,10 @@ def main():
     setup_ipset()
     setup_tun2socks_interface()
     setup_vpn_forwarding()
-    setup_iptables_fwmark()
+    if split_chain:
+        setup_iptables_fwmark_split()
+    else:
+        setup_iptables_fwmark()
     setup_tun2socks_routing()
     create_systemd_service()
 
