@@ -236,24 +236,36 @@ def setup_iptables_fwmark():
 
 
 def setup_iptables_fwmark_split():
-    # ساخت chain امن TUN2SOCKS (اگر وجود نداشته باشد)
+    # ساخت chain اگر نبود
     run_cmd("iptables -t mangle -N TUN2SOCKS 2>/dev/null || true")
+
+    # حذف jump قبلی (اگر وجود داشت)
+    run_cmd("iptables -t mangle -D PREROUTING -j TUN2SOCKS 2>/dev/null || true")
+
+    # اضافه کردن jump دوباره (تمیز)
     run_cmd("iptables -t mangle -A PREROUTING -j TUN2SOCKS")
 
-    # flush کردن فقط قوانین قبلی داخل chain TUN2SOCKS
+    # flush فقط chain خودش (مثل کد اصلی)
     run_cmd("iptables -t mangle -F TUN2SOCKS")
 
-    # اضافه کردن قوانین فقط به chain TUN2SOCKS
+    # قوانین اصلی
     if FULL_ROUTE_TO_PROXY:
         run_cmd(
-            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} "
+            f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1"
+        )
     else:
         run_cmd(
-            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -p tcp -m multiport --dports 80,443,8080,8443 -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -p tcp "
+            f"-m multiport --dports 80,443,8080,8443 "
+            f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1"
+        )
 
     if block_udp:
-        run_cmd("iptables -t mangle -A TUN2SOCKS -s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP")
-
+        run_cmd(
+            "iptables -t mangle -A TUN2SOCKS "
+            "-s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP"
+        )
 
 def setup_tun2socks_routing():
     run_cmd(
