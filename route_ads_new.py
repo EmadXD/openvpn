@@ -15,7 +15,7 @@ TUN_ADDR = "192.168.255.1/24"
 SOCKS_PROXY = "socks5://127.0.0.1:1080"
 use_binary_created = True
 
-split_chain = True
+split_chain = False
 
 DOMAINS = [
     "1e100.net",
@@ -236,36 +236,80 @@ def setup_iptables_fwmark():
 
 
 def setup_iptables_fwmark_split():
-    # ساخت chain اگر نبود
+    # ساخت chain امن TUN2SOCKS (اگر وجود نداشته باشد)
     run_cmd("iptables -t mangle -N TUN2SOCKS 2>/dev/null || true")
-
-    # حذف jump قبلی (اگر وجود داشت)
-    run_cmd("iptables -t mangle -D PREROUTING -j TUN2SOCKS 2>/dev/null || true")
-
-    # اضافه کردن jump دوباره (تمیز)
     run_cmd("iptables -t mangle -A PREROUTING -j TUN2SOCKS")
 
-    # flush فقط chain خودش (مثل کد اصلی)
+    # flush کردن فقط قوانین قبلی داخل chain TUN2SOCKS
     run_cmd("iptables -t mangle -F TUN2SOCKS")
 
-    # قوانین اصلی
+    # اضافه کردن قوانین فقط به chain TUN2SOCKS
     if FULL_ROUTE_TO_PROXY:
         run_cmd(
-            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} "
-            f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1"
-        )
+            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
     else:
         run_cmd(
-            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -p tcp "
-            f"-m multiport --dports 80,443,8080,8443 "
-            f"-m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1"
-        )
+            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -p tcp -m multiport --dports 80,443,8080,8443 -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
 
     if block_udp:
-        run_cmd(
-            "iptables -t mangle -A TUN2SOCKS "
-            "-s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP"
+        run_cmd("iptables -t mangle -A TUN2SOCKS -s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP")
+
+
+def setup_iptables_dnstt(DNSTT_PORT):
+    import subprocess
+    import shutil
+    import os
+    import sys
+
+    def run(cmd):
+        return subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+    # iptables exists?
+    if not shutil.which("iptables"):
+        sys.exit(1)
+
+    # detect interface
+    interface = None
+    try:
+        interface = subprocess.check_output(
+            "ip route | grep default | awk '{print $5}' | head -1",
+            shell=True,
+            text=True
+        ).strip()
+    except:
+        pass
+
+    if not interface:
+        try:
+            interface = subprocess.check_output(
+                r"ip link show | grep -E '^[0-9]+: (eth|ens|enp)' | head -1 | cut -d':' -f2 | awk '{print $1}'",
+                shell=True,
+                text=True
+            ).strip()
+        except:
+            pass
+
+    if not interface:
+        interface = "eth0"
+
+    # IPv4
+    if not run(f"iptables -I INPUT -p udp --dport {DNSTT_PORT} -j ACCEPT"):
+        sys.exit(1)
+
+    if not run(
+            f"iptables -t nat -I PREROUTING -i {interface} -p udp --dport 53 "
+            f"-j REDIRECT --to-ports {DNSTT_PORT}"
+    ):
+        sys.exit(1)
+
+    # IPv6 (best-effort)
+    if shutil.which("ip6tables") and os.path.exists("/proc/net/if_inet6"):
+        run(f"ip6tables -I INPUT -p udp --dport {DNSTT_PORT} -j ACCEPT")
+        run(
+            f"ip6tables -t nat -I PREROUTING -i {interface} -p udp --dport 53 "
+            f"-j REDIRECT --to-ports {DNSTT_PORT}"
         )
+
 
 def setup_tun2socks_routing():
     run_cmd(
@@ -359,6 +403,7 @@ def main():
     setup_tun2socks_routing()
     create_systemd_service()
 
+    setup_iptables_dnstt(5300)
     # ------------
     run_cmd("sudo systemctl stop systemd-resolved")
     run_cmd("sudo systemctl disable --now systemd-resolved")
