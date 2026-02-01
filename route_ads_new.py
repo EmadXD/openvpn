@@ -16,6 +16,7 @@ SOCKS_PROXY = "socks5://127.0.0.1:1080"
 use_binary_created = True
 
 split_chain = False
+use_dnstt = False
 
 DOMAINS = [
     "1e100.net",
@@ -403,7 +404,8 @@ def main():
     setup_tun2socks_routing()
     create_systemd_service()
 
-    setup_iptables_dnstt(5300)
+    if use_dnstt:
+        setup_iptables_dnstt(5300)
     # ------------
     run_cmd("sudo systemctl stop systemd-resolved")
     run_cmd("sudo systemctl disable --now systemd-resolved")
