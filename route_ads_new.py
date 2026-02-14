@@ -183,6 +183,7 @@ def setup_dnsmasq():
 listen-address=127.0.0.1,10.8.0.1
 bind-interfaces
 conf-dir=/etc/dnsmasq.d/,*.conf
+dns-forward-max=500
 """
     with open("/etc/dnsmasq.conf", "w") as f:
         f.write(dnsmasq_main)
