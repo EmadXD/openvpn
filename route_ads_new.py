@@ -16,7 +16,7 @@ SOCKS_PROXY = "socks5://127.0.0.1:1080"
 use_binary_created = True
 
 split_chain = False
-use_dnstt = False
+use_dnstt = True
 
 DOMAINS = [
     "1e100.net",
