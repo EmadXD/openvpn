@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
+import glob
+import ipaddress
 import os
+import platform
 import re
+import shlex
+import shutil
 import subprocess
 import sys
-import requests
+import tempfile
 import time
+import urllib.request
+import zipfile
+from pathlib import Path
+from urllib.parse import urlsplit
 
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
-VPN_SUBNET = "10.8.0.0/14"
+LEGACY_VPN_SUBNET = "10.8.0.0/14"
 PROXY_TABLE = "100"
 TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
 SOCKS_PROXY = "socks5://127.0.0.1:1080"
-use_binary_created = True
-
-split_chain = False
+MARK_CHAIN = "XD_T2S_MARK"
+FORWARD_CHAIN = "XD_T2S_FWD"
+NAT_CHAIN = "XD_T2S_NAT"
+HEALTH_INTERVAL_SECONDS = 60
+PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX"
+TUN2SOCKS_BINARY_URL = "https://aparatvpn.com/tun2socks"
 use_dnstt = False
 
 DOMAINS = [
@@ -80,17 +92,26 @@ block_udp = True
 
 
 # ---------------- Helpers ----------------
-def run_cmd(cmd):
+def run_cmd(cmd, check=False, timeout=300):
     print(f"[+] Running: {cmd}")
     try:
         result = subprocess.run(cmd, shell=True, check=True,
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, timeout=timeout)
         if result.stdout:
             print(result.stdout.strip())
+        return result
     except subprocess.CalledProcessError as e:
         print(f"[!] Error: {cmd}")
         if e.stderr:
             print(e.stderr.strip())
+        if check:
+            raise
+        return e
+    except subprocess.TimeoutExpired:
+        print(f"[!] Timeout after {timeout}s: {cmd}")
+        if check:
+            raise
+        return None
 
 
 def run_cmd_return(cmd):
@@ -113,101 +134,195 @@ def run_cmd_return(cmd):
         return error  # برگرداندن همان متن خطا
 
 
+def write_text_if_changed(path, content, mode=0o644):
+    target = Path(path)
+    if target.exists() and target.read_text() == content:
+        os.chmod(target, mode)
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_text(content)
+    os.chmod(temporary, mode)
+    os.replace(temporary, target)
+    return True
+
+
+def ensure_required_packages():
+    command_packages = {
+        "curl": "curl",
+        "dnsmasq": "dnsmasq",
+        "ipset": "ipset",
+        "iptables": "iptables",
+    }
+    missing = sorted({package for command, package in command_packages.items()
+                      if shutil.which(command) is None})
+    if not missing:
+        return
+    run_cmd("DEBIAN_FRONTEND=noninteractive apt-get update", check=True, timeout=600)
+    packages = " ".join(shlex.quote(package) for package in missing)
+    run_cmd(f"DEBIAN_FRONTEND=noninteractive apt-get install -y {packages}",
+            check=True, timeout=900)
+
+
+def valid_tun2socks_binary(path):
+    try:
+        candidate = Path(path)
+        if candidate.stat().st_size < 5 * 1024 * 1024:
+            return False
+        with candidate.open("rb") as handle:
+            return handle.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
+def download_file(url, destination, timeout=180):
+    result = subprocess.run(
+        ["curl", "-fL", "--connect-timeout", "15", "--max-time", str(timeout),
+         "--retry", "2", "--retry-delay", "2", "-o", str(destination), url],
+        capture_output=True,
+        text=True,
+        timeout=timeout + 15,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"download failed for {url}: {detail[-400:]}")
+
+
 # ---------------- Install Packages ----------------
 def setup_install_packages():
-    tun2socks_path = "/opt/tun2socks"
-
-    tun2socks_installed = os.path.exists(tun2socks_path)
-
-    if tun2socks_installed:
-        size_bytes = os.path.getsize(tun2socks_path)
-        size_mb = size_bytes / (1024 * 1024)
-    else:
-        size_mb = 0
-
-    if size_mb >= 10:
-        print("[+] tun2socks قبلاً نصب شده است، از مرحله نصب عبور می‌کنیم.")
+    tun2socks_path = Path("/opt/tun2socks")
+    if valid_tun2socks_binary(tun2socks_path):
+        print("[+] Existing tun2socks binary is valid.")
         return
 
-    print("[+] Installing required packages and building tun2socks...")
-    run_cmd("pip3 install requests")
+    architecture = platform.machine().lower()
+    asset_arch = {
+        "amd64": "amd64",
+        "x86_64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(architecture)
+    if not asset_arch:
+        raise RuntimeError(f"unsupported architecture for tun2socks: {architecture}")
 
-    # نصب Go
-    run_cmd("wget https://aparatvpn.com/go1.23.1.linux-amd64.tar.gz -O /tmp/go1.23.1.linux-amd64.tar.gz")
-    run_cmd("rm -rf /usr/local/go")
-    run_cmd("tar -C /usr/local -xzf /tmp/go1.23.1.linux-amd64.tar.gz")
-    os.environ["PATH"] = "/usr/local/go/bin:" + os.environ["PATH"]
+    errors = []
+    with tempfile.TemporaryDirectory(prefix="tun2socks-install-") as temp_dir:
+        temp_dir = Path(temp_dir)
+        candidate = temp_dir / "tun2socks"
 
-    # ساخت tun2socks
-    if use_binary_created:
-        run_cmd("sudo mkdir -p /opt/")
-        run_cmd("sudo rm -rf /opt/tun2socks")
-        run_cmd("sudo wget https://aparatvpn.com/tun2socks -O /opt/tun2socks")
-        run_cmd("sudo chmod 777 /opt/tun2socks")
-    else:
-        run_cmd("rm -rf tun2socks")
-        run_cmd("git clone https://github.com/xjasonlyu/tun2socks.git")
-        os.chdir("tun2socks")
-        run_cmd("make tun2socks")
-        run_cmd("cp ./build/tun2socks /usr/local/bin")
-        os.chdir("..")
-    # ------------- check again
-    tun2socks_installed = os.path.exists(tun2socks_path)
-    if tun2socks_installed:
-        size_bytes = os.path.getsize(tun2socks_path)
-        size_mb = size_bytes / (1024 * 1024)
-    else:
-        size_mb = 0
+        archive_url = (
+            "https://github.com/xjasonlyu/tun2socks/releases/latest/download/"
+            f"tun2socks-linux-{asset_arch}.zip"
+        )
+        try:
+            archive = temp_dir / "tun2socks.zip"
+            download_file(archive_url, archive)
+            with zipfile.ZipFile(archive) as zipped:
+                members = [name for name in zipped.namelist()
+                           if Path(name).name == f"tun2socks-linux-{asset_arch}"]
+                if not members:
+                    raise RuntimeError("tun2socks executable is missing from release archive")
+                candidate.write_bytes(zipped.read(members[0]))
+        except Exception as exc:
+            errors.append(str(exc))
 
-    if size_mb < 10:
-        print(f"[-] size error: {size_mb}")
-        setup_install_packages()
-    else:
-        print("[+] Installation completed successfully.")
+        if not valid_tun2socks_binary(candidate):
+            try:
+                candidate.unlink(missing_ok=True)
+                download_file(TUN2SOCKS_BINARY_URL, candidate)
+            except Exception as exc:
+                errors.append(str(exc))
+
+        if not valid_tun2socks_binary(candidate):
+            raise RuntimeError("unable to install a valid tun2socks binary: " + " | ".join(errors))
+
+        Path("/opt").mkdir(parents=True, exist_ok=True)
+        install_candidate = Path("/opt/.tun2socks.new")
+        shutil.copyfile(candidate, install_candidate)
+        os.chmod(install_candidate, 0o755)
+        os.replace(install_candidate, tun2socks_path)
+        print(f"[+] Installed tun2socks ({tun2socks_path.stat().st_size} bytes).")
+
+
+def discover_vpn_subnets():
+    networks = set()
+    config_paths = set(glob.glob("/etc/openvpn/server*.conf"))
+    config_paths.update(glob.glob("/etc/openvpn/server/*.conf"))
+
+    for config_path in sorted(config_paths):
+        try:
+            for raw_line in Path(config_path).read_text(errors="ignore").splitlines():
+                line = raw_line.split("#", 1)[0].split(";", 1)[0].strip()
+                match = re.match(r"^server\s+(\S+)\s+(\S+)$", line)
+                if not match:
+                    continue
+                networks.add(ipaddress.ip_network(
+                    f"{match.group(1)}/{match.group(2)}", strict=False
+                ))
+        except OSError as exc:
+            print(f"[!] Could not read {config_path}: {exc}")
+
+    try:
+        output = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout
+        for line in output.splitlines():
+            match = re.search(r"\d+:\s+(tun\d+)\s+.*?\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)", line)
+            if match:
+                networks.add(ipaddress.ip_interface(match.group(2)).network)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(f"[!] Could not inspect active OpenVPN interfaces: {exc}")
+
+    networks = {network for network in networks
+                if isinstance(network, ipaddress.IPv4Network)}
+    if not networks:
+        networks.add(ipaddress.ip_network(LEGACY_VPN_SUBNET))
+
+    # Collapse only exactly adjacent/overlapping networks. On a multi-instance
+    # host this turns 10.8/16..10.23/16 into two exact /13 rules instead of
+    # making every packet walk sixteen equivalent iptables rules.
+    result = sorted(
+        ipaddress.collapse_addresses(networks),
+        key=lambda item: (int(item.network_address), item.prefixlen),
+    )
+    print("[+] OpenVPN subnets: " + ", ".join(str(item) for item in result))
+    return [str(item) for item in result]
 
 
 # ---------------- ipset ----------------
 def setup_ipset():
-    run_cmd(f"ipset destroy {IPSET_NAME} || true")
-    run_cmd(f"ipset create {IPSET_NAME} hash:ip")
+    run_cmd(
+        f"ipset create {shlex.quote(IPSET_NAME)} hash:ip "
+        "family inet hashsize 4096 maxelem 1048576 -exist",
+        check=True,
+    )
 
 
 # ---------------- dnsmasq ----------------
 def setup_dnsmasq():
-    from subprocess import run
-    def run_cmd(cmd):
-        run(cmd, shell=True, check=False)
-
-    # ---------------- main dnsmasq.conf ----------------
     dnsmasq_main = """port=53
 listen-address=127.0.0.1,10.8.0.1
-bind-interfaces
+bind-dynamic
 conf-dir=/etc/dnsmasq.d/,*.conf
 dns-forward-max=999999
 """
-    with open("/etc/dnsmasq.conf", "w") as f:
-        f.write(dnsmasq_main)
-
-    # ---------------- ipset.conf ----------------
-    with open("/etc/dnsmasq.d/ipset.conf", "w") as f:
-        for domain in DOMAINS:
-            f.write(f"ipset=/{domain}/{IPSET_NAME}\n")
-
-    # ---------------- openvpn_dns.conf ----------------
-    dns_openvpn = """interface=tun0
-listen-address=10.8.0.1
-server=127.0.0.53
-"""
-    dns_openvpn = """interface=tun0
-listen-address=10.8.0.1
-server=1.1.1.1
+    ipset_config = "".join(
+        f"ipset=/{domain}/{IPSET_NAME}\n" for domain in DOMAINS
+    )
+    dns_openvpn = """server=1.1.1.1
 server=1.0.0.1
 """
-    with open("/etc/dnsmasq.d/openvpn_dns.conf", "w") as f:
-        f.write(dns_openvpn)
 
-    # ---------------- restart dnsmasq ----------------
-    run_cmd("systemctl restart dnsmasq")
+    write_text_if_changed("/etc/dnsmasq.conf", dnsmasq_main)
+    write_text_if_changed("/etc/dnsmasq.d/ipset.conf", ipset_config)
+    write_text_if_changed("/etc/dnsmasq.d/openvpn_dns.conf", dns_openvpn)
+    run_cmd("dnsmasq --test", check=True)
+    run_cmd("systemctl enable dnsmasq", check=True)
+    run_cmd("systemctl restart dnsmasq", check=True)
 
 
 # ---------------- tun2socks interface ----------------
@@ -218,43 +333,101 @@ def setup_tun2socks_interface():
 
 
 # ---------------- iptables ----------------
-def setup_vpn_forwarding():
-    run_cmd(f"iptables -A FORWARD -s {VPN_SUBNET} -o {TUN_DEV} -j ACCEPT")
-    run_cmd(f"iptables -A FORWARD -d {VPN_SUBNET} -i {TUN_DEV} -m state --state RELATED,ESTABLISHED -j ACCEPT")
-    run_cmd(f"iptables -t nat -A POSTROUTING -o {TUN_DEV} -s {VPN_SUBNET} -j MASQUERADE")
+def iptables_call(table, arguments, check=False):
+    command = ["iptables", "-w", "10"]
+    if table != "filter":
+        command.extend(["-t", table])
+    command.extend(arguments)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"iptables command failed: {' '.join(command)}: {result.stderr.strip()}"
+        )
+    return result
 
 
-def setup_iptables_fwmark():
-    run_cmd("iptables -t mangle -F PREROUTING")
-    if FULL_ROUTE_TO_PROXY:
-        run_cmd(
-            f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
-    else:
-        run_cmd(
-            f"iptables -t mangle -A PREROUTING -s {VPN_SUBNET} -p tcp -m multiport --dports 80,443,8080,8443 -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
-
-    if block_udp:
-        run_cmd("iptables -t mangle -A PREROUTING -s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP")
+def ensure_chain(table, chain):
+    result = iptables_call(table, ["-N", chain])
+    if result.returncode not in (0, 1):
+        raise RuntimeError(result.stderr.strip())
+    iptables_call(table, ["-F", chain], check=True)
 
 
-def setup_iptables_fwmark_split():
-    # ساخت chain امن TUN2SOCKS (اگر وجود نداشته باشد)
-    run_cmd("iptables -t mangle -N TUN2SOCKS 2>/dev/null || true")
-    run_cmd("iptables -t mangle -A PREROUTING -j TUN2SOCKS")
+def ensure_jump(table, parent, child):
+    rule = ["-j", child]
+    if iptables_call(table, ["-C", parent] + rule).returncode != 0:
+        iptables_call(table, ["-I", parent, "1"] + rule, check=True)
 
-    # flush کردن فقط قوانین قبلی داخل chain TUN2SOCKS
-    run_cmd("iptables -t mangle -F TUN2SOCKS")
 
-    # اضافه کردن قوانین فقط به chain TUN2SOCKS
-    if FULL_ROUTE_TO_PROXY:
-        run_cmd(
-            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
-    else:
-        run_cmd(
-            f"iptables -t mangle -A TUN2SOCKS -s {VPN_SUBNET} -p tcp -m multiport --dports 80,443,8080,8443 -m set --match-set {IPSET_NAME} dst -j MARK --set-mark 1")
+def remove_rule_all(table, chain, rule):
+    while iptables_call(table, ["-C", chain] + rule).returncode == 0:
+        iptables_call(table, ["-D", chain] + rule, check=True)
 
-    if block_udp:
-        run_cmd("iptables -t mangle -A TUN2SOCKS -s 10.8.0.0/14 -p udp -m mark --mark 1 -j DROP")
+
+def remove_legacy_rules():
+    legacy_mark = [
+        "-s", LEGACY_VPN_SUBNET,
+        "-m", "set", "--match-set", IPSET_NAME, "dst",
+        "-j", "MARK", "--set-mark", "1",
+    ]
+    legacy_mark_ports = [
+        "-s", LEGACY_VPN_SUBNET, "-p", "tcp",
+        "-m", "multiport", "--dports", "80,443,8080,8443",
+        "-m", "set", "--match-set", IPSET_NAME, "dst",
+        "-j", "MARK", "--set-mark", "1",
+    ]
+    legacy_udp = [
+        "-s", LEGACY_VPN_SUBNET, "-p", "udp",
+        "-m", "mark", "--mark", "1", "-j", "DROP",
+    ]
+    for rule in (legacy_mark, legacy_mark_ports, legacy_udp):
+        remove_rule_all("mangle", "PREROUTING", rule)
+
+    remove_rule_all("mangle", "PREROUTING", ["-j", "TUN2SOCKS"])
+
+
+def setup_vpn_forwarding(vpn_subnets):
+    ensure_chain("filter", FORWARD_CHAIN)
+    ensure_jump("filter", "FORWARD", FORWARD_CHAIN)
+    ensure_chain("nat", NAT_CHAIN)
+    ensure_jump("nat", "POSTROUTING", NAT_CHAIN)
+
+    for subnet in vpn_subnets:
+        iptables_call("filter", [
+            "-A", FORWARD_CHAIN, "-s", subnet, "-o", TUN_DEV, "-j", "ACCEPT"
+        ], check=True)
+        iptables_call("filter", [
+            "-A", FORWARD_CHAIN, "-d", subnet, "-i", TUN_DEV,
+            "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"
+        ], check=True)
+        iptables_call("nat", [
+            "-A", NAT_CHAIN, "-s", subnet, "-o", TUN_DEV, "-j", "MASQUERADE"
+        ], check=True)
+
+
+def setup_iptables_fwmark(vpn_subnets):
+    remove_legacy_rules()
+    ensure_chain("mangle", MARK_CHAIN)
+    ensure_jump("mangle", "PREROUTING", MARK_CHAIN)
+
+    for subnet in vpn_subnets:
+        mark_rule = ["-A", MARK_CHAIN, "-s", subnet]
+        if not FULL_ROUTE_TO_PROXY:
+            mark_rule.extend([
+                "-p", "tcp", "-m", "multiport",
+                "--dports", "80,443,8080,8443",
+            ])
+        mark_rule.extend([
+            "-m", "set", "--match-set", IPSET_NAME, "dst",
+            "-j", "MARK", "--set-xmark", "0x1/0x1",
+        ])
+        iptables_call("mangle", mark_rule, check=True)
+
+        if block_udp:
+            iptables_call("mangle", [
+                "-A", MARK_CHAIN, "-s", subnet, "-p", "udp",
+                "-m", "mark", "--mark", "0x1/0x1", "-j", "DROP",
+            ], check=True)
 
 
 def setup_iptables_dnstt(DNSTT_PORT):
@@ -314,13 +487,24 @@ def setup_iptables_dnstt(DNSTT_PORT):
 
 
 def setup_tun2socks_routing():
+    rt_tables_path = Path("/etc/iproute2/rt_tables")
+    rt_tables = rt_tables_path.read_text(errors="ignore")
+    if not re.search(rf"^\s*{re.escape(PROXY_TABLE)}\s+tun2socks\s*$", rt_tables, re.MULTILINE):
+        with rt_tables_path.open("a") as handle:
+            handle.write(f"\n{PROXY_TABLE} tun2socks\n")
+
+    rules = subprocess.run(
+        ["ip", "rule", "show"], check=True, capture_output=True, text=True, timeout=15
+    ).stdout
+    if not any("fwmark 0x1" in line and ("lookup tun2socks" in line or "lookup 100" in line)
+               for line in rules.splitlines()):
+        run_cmd("ip rule add priority 100 fwmark 0x1/0x1 table tun2socks", check=True)
+
+    gateway = TUN_ADDR.split("/")[0]
     run_cmd(
-        f"grep -q '^{PROXY_TABLE} tun2socks' /etc/iproute2/rt_tables || echo '{PROXY_TABLE} tun2socks' >> /etc/iproute2/rt_tables"
+        f"ip route replace default via {shlex.quote(gateway)} dev {shlex.quote(TUN_DEV)} table tun2socks",
+        check=True,
     )
-    run_cmd("ip rule del fwmark 1 table tun2socks || true")
-    run_cmd("ip route flush table tun2socks || true")
-    run_cmd("ip rule add fwmark 1 table tun2socks")
-    run_cmd(f"ip route add default via {TUN_ADDR.split('/')[0]} dev {TUN_DEV} table tun2socks")
 
 
 # ---------------- systemd tun2socks ----------------
@@ -329,43 +513,250 @@ def clean_proxy_url(raw_url: str) -> str:
     url = re.sub(r'\s+', '', url)
     if not url.startswith("socks5://") and not url.startswith("http://") and not url.startswith("https://"):
         url = "socks5://" + url
-    return url.rstrip('/')
+    url = url.rstrip('/')
+    try:
+        parsed = urlsplit(url)
+        valid = (
+            parsed.scheme in {"socks5", "http", "https"}
+            and bool(parsed.hostname)
+            and parsed.port is not None
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("proxy API returned an invalid proxy URL")
+    return url
+
+
+def current_service_proxy():
+    service_path = Path("/etc/systemd/system/tun2socks.service")
+    if not service_path.exists():
+        return None
+    match = re.search(
+        r"^ExecStart=.*?\s-proxy\s+(\S+)",
+        service_path.read_text(errors="ignore"),
+        re.MULTILINE,
+    )
+    if not match:
+        return None
+    try:
+        # A literal percent sign is escaped as %% inside a systemd unit.
+        return clean_proxy_url(match.group(1).strip("\"'").replace("%%", "%"))
+    except ValueError:
+        return None
+
+
+def fetch_proxy_url():
+    try:
+        request = urllib.request.Request(PROXY_API_URL, headers={"User-Agent": "XD-route-ads/2"})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 200:
+                raise RuntimeError(f"proxy API returned HTTP {response.status}")
+            return clean_proxy_url(response.read(4096).decode("utf-8", errors="replace"))
+    except Exception as exc:
+        existing = current_service_proxy()
+        if existing:
+            print(f"[!] Proxy fetch failed; preserving current service proxy: {exc}")
+            return existing
+        raise RuntimeError(f"proxy fetch failed and no previous proxy is available: {exc}") from exc
+
+
+def redact_proxy(proxy_url):
+    return re.sub(r"(?<=//)[^/@]+@", "***@", proxy_url)
 
 
 def create_systemd_service():
     global SOCKS_PROXY
-    try:
-        SOCKS_PROXY = clean_proxy_url(
-            requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX").text
-        )
-    except:
-        print("[!] Proxy fetch failed, using default.")
+    SOCKS_PROXY = fetch_proxy_url()
+    systemd_proxy = SOCKS_PROXY.replace("%", "%%")
+    print(f"[+] Using proxy: {redact_proxy(SOCKS_PROXY)}")
 
-    service_content = f"""
-[Unit]
+    service_content = f"""[Unit]
 Description=Tun2Socks Service
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 ExecStartPre=/bin/bash -c 'ip link show {TUN_DEV} >/dev/null 2>&1 || ip tuntap add dev {TUN_DEV} mode tun'
 ExecStartPre=/bin/bash -c 'ip addr show dev {TUN_DEV} | grep -q "{TUN_ADDR.split("/")[0]}" || ip addr add {TUN_ADDR} dev {TUN_DEV}'
 ExecStartPre=/sbin/ip link set {TUN_DEV} up
-ExecStart=/opt/tun2socks -device {TUN_DEV} -proxy {SOCKS_PROXY} -loglevel error
+ExecStart=/opt/tun2socks -device {TUN_DEV} -proxy {systemd_proxy} -loglevel error
 Restart=always
 RestartSec=3
+LimitNOFILE=1048576
+TasksMax=infinity
+TimeoutStopSec=5s
+KillMode=mixed
+SendSIGKILL=yes
 
 [Install]
 WantedBy=multi-user.target
 """
+    changed = write_text_if_changed(
+        "/etc/systemd/system/tun2socks.service", service_content, mode=0o600
+    )
+    if changed:
+        run_cmd("systemctl daemon-reload", check=True)
+    run_cmd("systemctl enable tun2socks.service", check=True)
+    run_cmd("systemctl restart tun2socks.service", check=True)
 
-    path = "/etc/systemd/system/tun2socks.service"
-    with open(path, "w") as f:
-        f.write(service_content)
 
-    run_cmd("systemctl daemon-reload")
-    run_cmd("systemctl enable --now tun2socks.service")
-    run_cmd("systemctl restart tun2socks.service")
+def prepare_dnsmasq_install():
+    run_cmd("systemctl disable --now systemd-resolved 2>/dev/null || true")
+    try:
+        Path("/etc/resolv.conf").unlink(missing_ok=True)
+    except OSError:
+        pass
+    write_text_if_changed(
+        "/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 1.0.0.1\n"
+    )
+
+
+def use_local_dnsmasq():
+    run_cmd("systemctl disable --now systemd-resolved 2>/dev/null || true")
+    try:
+        Path("/etc/resolv.conf").unlink(missing_ok=True)
+    except OSError:
+        pass
+    write_text_if_changed("/etc/resolv.conf", "nameserver 10.8.0.1\n")
+
+
+def firewall_rules_present(vpn_subnets):
+    if iptables_call("mangle", ["-C", "PREROUTING", "-j", MARK_CHAIN]).returncode != 0:
+        return False
+    if iptables_call("filter", ["-C", "FORWARD", "-j", FORWARD_CHAIN]).returncode != 0:
+        return False
+    if iptables_call("nat", ["-C", "POSTROUTING", "-j", NAT_CHAIN]).returncode != 0:
+        return False
+    for subnet in vpn_subnets:
+        mark_rule = ["-s", subnet]
+        if not FULL_ROUTE_TO_PROXY:
+            mark_rule.extend([
+                "-p", "tcp", "-m", "multiport", "--dports", "80,443,8080,8443"
+            ])
+        mark_rule.extend([
+            "-m", "set", "--match-set", IPSET_NAME, "dst",
+            "-j", "MARK", "--set-xmark", "0x1/0x1",
+        ])
+        forward_out = ["-s", subnet, "-o", TUN_DEV, "-j", "ACCEPT"]
+        forward_back = [
+            "-d", subnet, "-i", TUN_DEV,
+            "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT",
+        ]
+        masquerade = ["-s", subnet, "-o", TUN_DEV, "-j", "MASQUERADE"]
+        checks = (
+            ("mangle", MARK_CHAIN, mark_rule),
+            ("filter", FORWARD_CHAIN, forward_out),
+            ("filter", FORWARD_CHAIN, forward_back),
+            ("nat", NAT_CHAIN, masquerade),
+        )
+        if any(
+            iptables_call(table, ["-C", chain] + rule).returncode != 0
+            for table, chain, rule in checks
+        ):
+            return False
+        if block_udp:
+            udp_drop = [
+                "-s", subnet, "-p", "udp",
+                "-m", "mark", "--mark", "0x1/0x1", "-j", "DROP",
+            ]
+            if iptables_call("mangle", ["-C", MARK_CHAIN] + udp_drop).returncode != 0:
+                return False
+    return True
+
+
+def service_is_active(unit):
+    return subprocess.run(
+        ["systemctl", "is-active", "--quiet", unit],
+        timeout=15,
+    ).returncode == 0
+
+
+def tun_interface_is_ready():
+    result = subprocess.run(
+        ["ip", "-o", "-4", "addr", "show", "dev", TUN_DEV],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return result.returncode == 0 and TUN_ADDR.split("/")[0] in result.stdout
+
+
+def policy_routing_is_ready():
+    rules = subprocess.run(
+        ["ip", "rule", "show"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    routes = subprocess.run(
+        ["ip", "route", "show", "table", PROXY_TABLE],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    rule_present = rules.returncode == 0 and any(
+        "fwmark 0x1" in line
+        and ("lookup tun2socks" in line or f"lookup {PROXY_TABLE}" in line)
+        for line in rules.stdout.splitlines()
+    )
+    expected_gateway = TUN_ADDR.split("/")[0]
+    route_present = (
+        routes.returncode == 0
+        and any(
+            line.startswith("default ")
+            and f"via {expected_gateway}" in line
+            and f"dev {TUN_DEV}" in line
+            for line in routes.stdout.splitlines()
+        )
+    )
+    return rule_present and route_present
+
+
+def ipset_is_ready():
+    return subprocess.run(
+        ["ipset", "list", IPSET_NAME],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+    ).returncode == 0
+
+
+def apply_runtime_routing(vpn_subnets):
+    setup_tun2socks_interface()
+    setup_tun2socks_routing()
+    setup_vpn_forwarding(vpn_subnets)
+    setup_iptables_fwmark(vpn_subnets)
+
+
+def health_loop(initial_subnets):
+    known_subnets = initial_subnets
+    while True:
+        time.sleep(HEALTH_INTERVAL_SECONDS)
+        try:
+            current_subnets = discover_vpn_subnets()
+            if not service_is_active("dnsmasq.service"):
+                setup_ipset()
+                run_cmd("systemctl restart dnsmasq.service", check=True)
+            if not service_is_active("tun2socks.service"):
+                run_cmd("systemctl restart tun2socks.service", check=True)
+            runtime_ready = (
+                ipset_is_ready()
+                and tun_interface_is_ready()
+                and policy_routing_is_ready()
+                and firewall_rules_present(current_subnets)
+            )
+            if current_subnets != known_subnets or not runtime_ready:
+                setup_ipset()
+                apply_runtime_routing(current_subnets)
+                known_subnets = current_subnets
+                print("[+] Runtime routing rules repaired.")
+        except Exception as exc:
+            print(f"[!] Health check failed: {exc}")
 
 
 # ---------------- main ----------------
@@ -374,68 +765,28 @@ def main():
         print("[!] لطفاً با sudo اجرا کنید.")
         sys.exit(1)
 
-    time.sleep(2)
-    # ------------
-    if os.path.exists("/etc/dnsmasq.d/openvpn_dns.conf"):
-        run_cmd("sudo systemctl stop systemd-resolved")
-        run_cmd("sudo systemctl disable --now systemd-resolved")
-        run_cmd("sudo rm -f /etc/resolv.conf")
-        run_cmd('echo "nameserver 10.8.0.1" | sudo tee /etc/resolv.conf')
-
-        run_cmd("sudo systemctl restart dnsmasq")
-        time.sleep(2)
-        run_cmd("sudo systemctl enable dnsmasq")
-        time.sleep(2)
-    # ------------
-    run_cmd("sudo apt update")
-    run_cmd("sudo apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip dnsmasq")
-    setup_dnsmasq()
-
-    run_cmd("sudo apt install -y wget git make ipset build-essential shadowsocks-libev python3-pip dnsmasq")
-    setup_dnsmasq()
-
+    prepare_dnsmasq_install()
+    ensure_required_packages()
     setup_install_packages()
     setup_ipset()
+    setup_dnsmasq()
+    use_local_dnsmasq()
     setup_tun2socks_interface()
-    setup_vpn_forwarding()
-    if split_chain:
-        setup_iptables_fwmark_split()
-    else:
-        setup_iptables_fwmark()
-    setup_tun2socks_routing()
     create_systemd_service()
+    vpn_subnets = discover_vpn_subnets()
+    apply_runtime_routing(vpn_subnets)
 
     if use_dnstt:
         setup_iptables_dnstt(5300)
-    # ------------
-    run_cmd("sudo systemctl stop systemd-resolved")
-    run_cmd("sudo systemctl disable --now systemd-resolved")
-    run_cmd("sudo rm -f /etc/resolv.conf")
-    run_cmd('echo "nameserver 10.8.0.1" | sudo tee /etc/resolv.conf')
-
-    run_cmd("sudo systemctl restart dnsmasq")
-    time.sleep(2)
-    run_cmd("sudo systemctl enable dnsmasq")
-    time.sleep(2)
-    # ------------
-
-    run_cmd(
-        """sudo sed -i.bak '/^push "dhcp-option DNS/d' /etc/openvpn/server.conf && \
-echo 'push "dhcp-option DNS 10.8.0.1"' | sudo tee -a /etc/openvpn/server.conf
-""")
-    time.sleep(2)
-    run_cmd("""sudo systemctl restart openvpn@server""")
-    print("\n[+] آماده شد! سیستم‌دی‌ان‌اس اصلی فعال است و فقط دامنه‌های خاص از tun2socks عبور می‌کنند.")
+    print("\n[+] Selective tun2socks routing is active for every OpenVPN subnet.")
+    health_loop(vpn_subnets)
 
 
 if __name__ == "__main__":
     try:
-        time.sleep(10)
         main()
-        time.sleep(90000000)
     except KeyboardInterrupt:
-        time.sleep(90000000)
-        print("خروج کاربر...")
+        print("Stopped by user.")
     except Exception as e:
-        time.sleep(90000000)
-        print(f"خطا: {e}")
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
