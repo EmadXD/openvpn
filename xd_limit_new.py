@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Raise RAM-aware live limits for an OpenVPN/stunnel server.
+"""Apply RAM-aware runtime capacity tuning for OpenVPN/stunnel servers.
 
-This version intentionally changes runtime state only. It does not create a
-systemd service, edit stunnel/OpenVPN configuration, or write persistent sysctl
-files. PM2 can start it after boot; use --once for a manual apply-and-exit run.
+The script is safe to run under PM2: it applies the complete profile at start,
+then refreshes only live process and network settings. It never changes routes,
+IP addresses, firewall rules, OpenVPN configuration, or stunnel configuration.
+Use --once for a manual apply-and-exit run.
 """
 
 import argparse
@@ -170,7 +171,7 @@ PROCESS_NPROC = PROFILE.process_nproc
 SERVICE_TASKS_MAX = PROFILE.service_tasks_max
 CONNTRACK_MAX = PROFILE.conntrack_max
 CONNTRACK_HASHSIZE = PROFILE.conntrack_hashsize
-FLOAT_STATE_DIR = Path("/etc/xd-dedicated-float")
+DEFAULT_REFRESH_SECONDS = 300
 
 PROCESS_NAMES = (
     "stunnel",
@@ -203,6 +204,7 @@ SYSCTLS: Dict[str, str] = {
     "kernel.pid_max": "4194304",
     "kernel.threads-max": str(PROFILE.kernel_threads_max),
     "vm.max_map_count": str(PROFILE.vm_max_map_count),
+    "net.core.default_qdisc": "fq",
     "net.core.somaxconn": "65535",
     "net.core.netdev_budget": str(PROFILE.netdev_budget),
     "net.core.netdev_budget_usecs": "8000",
@@ -212,6 +214,7 @@ SYSCTLS: Dict[str, str] = {
     "net.core.wmem_max": str(PROFILE.socket_buffer_max),
     "net.ipv4.ip_forward": "1",
     "net.ipv4.ip_local_port_range": "1024 65535",
+    "net.ipv4.ip_local_reserved_ports": "1194-1225",
     "net.ipv4.tcp_fin_timeout": "15",
     "net.ipv4.tcp_keepalive_time": "600",
     "net.ipv4.tcp_keepalive_intvl": "30",
@@ -430,31 +433,25 @@ def physical_interfaces() -> List[str]:
     return interfaces
 
 
-def managed_float_state_present(state_dir: Path = FLOAT_STATE_DIR) -> bool:
-    """Return true when the dedicated floating-IP manager has active state."""
-    try:
-        state_files = sorted(state_dir.glob("host-*.ips"))
-    except OSError:
-        return False
-
-    for state_file in state_files:
-        try:
-            lines = state_file.read_text(encoding="ascii").splitlines()
-        except OSError:
-            continue
-        if any(line.strip() and not line.lstrip().startswith("#") for line in lines):
-            return True
-    return False
-
-
-def interface_ipv4_address_count(interface: str) -> int:
-    """Return global IPv4 count, or -1 when it cannot be determined safely."""
-    result = run(
-        ["ip", "-4", "-o", "addr", "show", "dev", interface, "scope", "global"]
+def tune_cpu_governor() -> Tuple[int, List[str]]:
+    """Select the performance governor where the host exposes CPU frequency control."""
+    success = 0
+    errors: List[str] = []
+    governor_paths = sorted(
+        Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor")
     )
-    if result.returncode != 0:
-        return -1
-    return sum(1 for line in result.stdout.splitlines() if line.strip())
+    for governor_path in governor_paths:
+        available_path = governor_path.with_name("scaling_available_governors")
+        try:
+            available = available_path.read_text(encoding="ascii").split()
+            if available and "performance" not in available:
+                continue
+            if governor_path.read_text(encoding="ascii").strip() != "performance":
+                governor_path.write_text("performance", encoding="ascii")
+            success += 1
+        except OSError as exc:
+            errors.append(f"{governor_path}: {exc}")
+    return success, errors
 
 
 def parse_ring_parameters(output: str) -> Dict[str, Dict[str, int]]:
@@ -477,12 +474,57 @@ def parse_ring_parameters(output: str) -> Dict[str, Dict[str, int]]:
     return values
 
 
+def cpu_mask(cpu_count: int) -> str:
+    """Return a Linux cpumask covering every online logical CPU."""
+    bits = (1 << max(1, cpu_count)) - 1
+    groups: List[str] = []
+    while bits:
+        groups.append(f"{bits & 0xFFFFFFFF:08x}")
+        bits >>= 32
+    groups[-1] = groups[-1].lstrip("0") or "0"
+    return ",".join(reversed(groups))
+
+
+def tune_receive_flow_steering(interface: str) -> Tuple[int, List[str]]:
+    """Spread 10 Gbps receive processing across otherwise idle CPUs."""
+    cpu_count = os.cpu_count() or 1
+    if cpu_count < 16:
+        return 0, []
+
+    queue_paths = sorted(Path(f"/sys/class/net/{interface}/queues").glob("rx-*"))
+    if not queue_paths:
+        return 0, []
+
+    errors: List[str] = []
+    success = 0
+    table_size = 1_048_576
+    per_queue = max(4_096, min(32_768, table_size // len(queue_paths)))
+    global_table = run(
+        ["sysctl", "-w", f"net.core.rps_sock_flow_entries={table_size}"]
+    )
+    if global_table.returncode != 0:
+        errors.append(
+            f"{interface} RFS table: "
+            f"{global_table.stderr.strip() or global_table.stdout.strip()}"
+        )
+        return success, errors
+
+    mask = cpu_mask(cpu_count)
+    for queue_path in queue_paths:
+        try:
+            (queue_path / "rps_cpus").write_text(mask, encoding="ascii")
+            (queue_path / "rps_flow_cnt").write_text(str(per_queue), encoding="ascii")
+            success += 1
+        except OSError as exc:
+            errors.append(f"{queue_path.name} RFS: {exc}")
+    return success, errors
+
+
 def tune_network_interfaces() -> Tuple[int, List[str]]:
-    """Apply live queue tuning while preserving managed floating IP aliases."""
+    """Apply idempotent live queue tuning without touching interface addresses."""
     success = 0
     errors: List[str] = []
     ethtool = shutil.which("ethtool")
-    managed_float_host = managed_float_state_present()
 
     for interface in physical_interfaces():
         qlen = run(["ip", "link", "set", "dev", interface, "txqueuelen", "10000"])
@@ -491,18 +533,17 @@ def tune_network_interfaces() -> Tuple[int, List[str]]:
         else:
             errors.append(f"{interface} txqueuelen: {qlen.stderr.strip() or qlen.stdout.strip()}")
 
-        address_count = interface_ipv4_address_count(interface)
-        if managed_float_host or address_count != 1:
-            address_detail = "unknown" if address_count < 0 else str(address_count)
-            log(
-                f"{interface}: preserving {address_detail} global IPv4 address(es); "
-                "skipping ring and interrupt-coalescing changes"
-            )
-            continue
-
         if not ethtool:
             errors.append(f"{interface} ring: ethtool is not installed")
             continue
+
+        speed = run([ethtool, interface])
+        speed_match = re.search(r"^\s*Speed:\s*(\d+)Mb/s", speed.stdout, re.MULTILINE)
+        speed_mbps = int(speed_match.group(1)) if speed.returncode == 0 and speed_match else 0
+        if speed_mbps >= 10_000:
+            rfs_success, rfs_errors = tune_receive_flow_steering(interface)
+            success += rfs_success
+            errors.extend(rfs_errors)
 
         ring = run([ethtool, "-g", interface])
         if ring.returncode != 0:
@@ -525,10 +566,8 @@ def tune_network_interfaces() -> Tuple[int, List[str]]:
             else:
                 success += 1
 
-        speed = run([ethtool, interface])
-        speed_match = re.search(r"^\s*Speed:\s*(\d+)Mb/s", speed.stdout, re.MULTILINE)
-        if speed.returncode == 0 and speed_match and int(speed_match.group(1)) >= 10_000:
-            coalesce = run([ethtool, "-C", interface, "rx-usecs", "8"])
+        if speed_mbps >= 10_000:
+            coalesce = run([ethtool, "-C", interface, "rx-usecs", "1"])
             if coalesce.returncode == 0:
                 success += 1
             else:
@@ -549,7 +588,7 @@ def tune_network_interfaces() -> Tuple[int, List[str]]:
             )
         )
         for interface in tun_names:
-            qlen = run(["ip", "link", "set", "dev", interface, "txqueuelen", "4096"])
+            qlen = run(["ip", "link", "set", "dev", interface, "txqueuelen", "8192"])
             if qlen.returncode == 0:
                 success += 1
             else:
@@ -645,6 +684,7 @@ def apply_limits() -> int:
     sysctl_ok, sysctl_errors = apply_sysctls()
     service_ok, service_errors = apply_runtime_task_limits()
     process_ok, process_errors = apply_process_limits()
+    cpu_ok, cpu_errors = tune_cpu_governor()
     network_ok, network_errors = tune_network_interfaces()
     own_errors = apply_own_limits()
 
@@ -652,6 +692,7 @@ def apply_limits() -> int:
         sysctl_errors
         + service_errors
         + process_errors
+        + cpu_errors
         + network_errors
         + own_errors
     )
@@ -660,7 +701,8 @@ def apply_limits() -> int:
     log(
         "applied "
         f"sysctl={sysctl_ok}/{len(SYSCTLS)} "
-        f"services={service_ok} processes={process_ok} network={network_ok} "
+        f"services={service_ok} processes={process_ok} cpu={cpu_ok} "
+        f"network={network_ok} "
         f"hashsize={'ok' if hash_ok else 'warning'} ({hash_detail})"
     )
     log(
@@ -680,6 +722,21 @@ def apply_limits() -> int:
     return 0
 
 
+def refresh_live_tuning() -> None:
+    """Recover settings that can be reset by a process or interface restart."""
+    process_ok, process_errors = apply_process_limits()
+    cpu_ok, cpu_errors = tune_cpu_governor()
+    network_ok, network_errors = tune_network_interfaces()
+    errors = process_errors + cpu_errors + network_errors
+    if errors:
+        for error in errors:
+            log(f"REFRESH WARN {error}")
+        return
+    log(
+        f"refreshed processes={process_ok} cpu={cpu_ok} network={network_ok}"
+    )
+
+
 def request_stop(signum: int, _frame: object) -> None:
     global STOP_REQUESTED
     STOP_REQUESTED = True
@@ -692,6 +749,15 @@ def parse_args() -> argparse.Namespace:
         "--once",
         action="store_true",
         help="apply limits and exit instead of staying idle for PM2",
+    )
+    parser.add_argument(
+        "--refresh-seconds",
+        type=int,
+        default=DEFAULT_REFRESH_SECONDS,
+        help=(
+            "refresh live process/NIC/TUN settings at this interval under PM2; "
+            "use 0 to disable (default: 300)"
+        ),
     )
     return parser.parse_args()
 
@@ -707,9 +773,18 @@ def main() -> int:
 
     if result != 0:
         log("one or more settings failed; staying idle to avoid a PM2 restart loop")
-    log("idle under PM2; limits will be applied again when PM2 starts after reboot")
+    if args.refresh_seconds < 0 or 0 < args.refresh_seconds < 30:
+        raise SystemExit("--refresh-seconds must be 0 or at least 30")
+    if args.refresh_seconds == 0:
+        log("idle under PM2; live refresh is disabled")
+    else:
+        log(f"idle under PM2; refreshing live tuning every {args.refresh_seconds}s")
+    next_refresh = time.monotonic() + args.refresh_seconds
     while not STOP_REQUESTED:
         time.sleep(1)
+        if args.refresh_seconds and time.monotonic() >= next_refresh:
+            refresh_live_tuning()
+            next_refresh = time.monotonic() + args.refresh_seconds
     return 0
 
 
