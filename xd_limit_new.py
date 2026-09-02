@@ -170,6 +170,7 @@ PROCESS_NPROC = PROFILE.process_nproc
 SERVICE_TASKS_MAX = PROFILE.service_tasks_max
 CONNTRACK_MAX = PROFILE.conntrack_max
 CONNTRACK_HASHSIZE = PROFILE.conntrack_hashsize
+FLOAT_STATE_DIR = Path("/etc/xd-dedicated-float")
 
 PROCESS_NAMES = (
     "stunnel",
@@ -429,6 +430,33 @@ def physical_interfaces() -> List[str]:
     return interfaces
 
 
+def managed_float_state_present(state_dir: Path = FLOAT_STATE_DIR) -> bool:
+    """Return true when the dedicated floating-IP manager has active state."""
+    try:
+        state_files = sorted(state_dir.glob("host-*.ips"))
+    except OSError:
+        return False
+
+    for state_file in state_files:
+        try:
+            lines = state_file.read_text(encoding="ascii").splitlines()
+        except OSError:
+            continue
+        if any(line.strip() and not line.lstrip().startswith("#") for line in lines):
+            return True
+    return False
+
+
+def interface_ipv4_address_count(interface: str) -> int:
+    """Return global IPv4 count, or -1 when it cannot be determined safely."""
+    result = run(
+        ["ip", "-4", "-o", "addr", "show", "dev", interface, "scope", "global"]
+    )
+    if result.returncode != 0:
+        return -1
+    return sum(1 for line in result.stdout.splitlines() if line.strip())
+
+
 def parse_ring_parameters(output: str) -> Dict[str, Dict[str, int]]:
     values: Dict[str, Dict[str, int]] = {"maximum": {}, "current": {}}
     section = ""
@@ -450,10 +478,11 @@ def parse_ring_parameters(output: str) -> Dict[str, Dict[str, int]]:
 
 
 def tune_network_interfaces() -> Tuple[int, List[str]]:
-    """Apply live queue tuning without restarting or reloading an interface."""
+    """Apply live queue tuning while preserving managed floating IP aliases."""
     success = 0
     errors: List[str] = []
     ethtool = shutil.which("ethtool")
+    managed_float_host = managed_float_state_present()
 
     for interface in physical_interfaces():
         qlen = run(["ip", "link", "set", "dev", interface, "txqueuelen", "10000"])
@@ -461,6 +490,15 @@ def tune_network_interfaces() -> Tuple[int, List[str]]:
             success += 1
         else:
             errors.append(f"{interface} txqueuelen: {qlen.stderr.strip() or qlen.stdout.strip()}")
+
+        address_count = interface_ipv4_address_count(interface)
+        if managed_float_host or address_count != 1:
+            address_detail = "unknown" if address_count < 0 else str(address_count)
+            log(
+                f"{interface}: preserving {address_detail} global IPv4 address(es); "
+                "skipping ring and interrupt-coalescing changes"
+            )
+            continue
 
         if not ethtool:
             errors.append(f"{interface} ring: ethtool is not installed")
