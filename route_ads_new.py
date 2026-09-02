@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import glob
 import ipaddress
+import json
 import os
 import platform
 import re
@@ -10,10 +11,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
@@ -27,7 +29,13 @@ FORWARD_CHAIN = "XD_T2S_FWD"
 NAT_CHAIN = "XD_T2S_NAT"
 HEALTH_INTERVAL_SECONDS = 60
 PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX"
+FLOAT_IP_API_URL = "https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=XXX"
 TUN2SOCKS_BINARY_URL = "https://aparatvpn.com/tun2socks"
+FLOAT_STATE_DIR = Path("/etc/xd-dedicated-float")
+FLOAT_SERVICE_PREFIX = "xd-dedicated-float-"
+FLOAT_SYNC_SCRIPT_PATH = Path("/usr/local/sbin/xd-dedicated-float-sync")
+FLOAT_UNIT_DIR = Path("/etc/systemd/system")
+MAX_FLOAT_IPS = 65536
 use_dnstt = False
 
 DOMAINS = [
@@ -144,6 +152,335 @@ def write_text_if_changed(path, content, mode=0o644):
     temporary.write_text(content)
     os.chmod(temporary, mode)
     os.replace(temporary, target)
+    return True
+
+
+def load_managed_float_states(state_dir=FLOAT_STATE_DIR):
+    """Load the floating IPs already supplied by the dedicated host manager."""
+    states = {}
+    try:
+        state_files = sorted(state_dir.glob("host-*.ips"))
+    except OSError as exc:
+        print(f"[!] Could not inspect floating-IP state: {exc}")
+        return states
+
+    for state_file in state_files:
+        match = re.fullmatch(r"host-(\d+)\.ips", state_file.name)
+        if not match:
+            continue
+        try:
+            lines = state_file.read_text(encoding="ascii").splitlines()
+        except OSError as exc:
+            print(f"[!] Could not read {state_file}: {exc}")
+            continue
+
+        addresses = set()
+        for line in lines:
+            raw_address = line.split("#", 1)[0].strip()
+            if not raw_address:
+                continue
+            try:
+                address = ipaddress.ip_address(raw_address.split("/", 1)[0])
+            except ValueError:
+                print(f"[!] Ignoring invalid floating IP in {state_file}: {raw_address}")
+                continue
+            if isinstance(address, ipaddress.IPv4Address):
+                addresses.add(str(address))
+        if addresses:
+            states[match.group(1)] = addresses
+    return states
+
+
+def primary_source_ipv4():
+    """Return the IPv4 address the host uses for ordinary Internet traffic."""
+    result = subprocess.run(
+        ["ip", "-4", "route", "get", "1.1.1.1"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "could not determine primary IPv4")
+    match = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)\b", result.stdout)
+    if not match:
+        raise RuntimeError("primary IPv4 was not present in the route result")
+    address = ipaddress.ip_address(match.group(1))
+    if not isinstance(address, ipaddress.IPv4Address):
+        raise RuntimeError("primary address is not IPv4")
+    return str(address)
+
+
+def split_pool_tokens(raw_value):
+    return [
+        token.strip().strip("\\")
+        for token in re.split(r"[,;\s]+", str(raw_value or ""))
+        if token.strip().strip("\\")
+    ]
+
+
+def expand_ip_token(token, max_addresses=MAX_FLOAT_IPS):
+    token = token.strip()
+    if not token:
+        return []
+
+    if "-" in token and "/" not in token:
+        start_raw, end_raw = token.split("-", 1)
+        start = ipaddress.ip_address(start_raw.strip())
+        end = ipaddress.ip_address(end_raw.strip())
+        if not isinstance(start, ipaddress.IPv4Address) or not isinstance(end, ipaddress.IPv4Address):
+            raise ValueError("only IPv4 ranges are supported")
+        count = int(end) - int(start) + 1
+        if count <= 0 or count > max_addresses:
+            raise ValueError(f"invalid or oversized IPv4 range: {token}")
+        return [str(ipaddress.ip_address(value)) for value in range(int(start), int(end) + 1)]
+
+    if "/" in token:
+        network = ipaddress.ip_network(token, strict=False)
+        if not isinstance(network, ipaddress.IPv4Network):
+            raise ValueError("only IPv4 networks are supported")
+        if network.num_addresses > max_addresses + 2:
+            raise ValueError(f"oversized IPv4 network: {token}")
+        return [str(address) for address in network.hosts()]
+
+    address = ipaddress.ip_address(token)
+    if not isinstance(address, ipaddress.IPv4Address):
+        raise ValueError("only IPv4 addresses are supported")
+    return [str(address)]
+
+
+def expand_ip_pool(raw_value):
+    addresses = []
+    seen = set()
+    for token in split_pool_tokens(raw_value):
+        try:
+            expanded = expand_ip_token(token, MAX_FLOAT_IPS - len(addresses))
+        except ValueError as exc:
+            print(f"[!] Ignoring invalid floating-IP pool token {token!r}: {exc}")
+            continue
+        for address in expanded:
+            if address not in seen:
+                seen.add(address)
+                addresses.append(address)
+                if len(addresses) >= MAX_FLOAT_IPS:
+                    return addresses
+    return addresses
+
+
+def split_subnet_definitions(raw_value):
+    return [
+        item.strip().strip("\\")
+        for item in re.split(r"[,;\n]+", str(raw_value or ""))
+        if item.strip().strip("\\")
+    ]
+
+
+def expand_subnet_definitions(raw_value):
+    addresses = []
+    seen = set()
+    for definition in split_subnet_definitions(raw_value):
+        parts = [part.strip() for part in definition.split(":")]
+        interface_raw = parts[0]
+        gateway_raw = parts[1] if len(parts) > 1 else ""
+        try:
+            interface = ipaddress.ip_interface(interface_raw)
+            if not isinstance(interface, ipaddress.IPv4Interface):
+                raise ValueError("only IPv4 subnets are supported")
+            gateway = ipaddress.ip_address(gateway_raw) if gateway_raw else None
+            if gateway is not None and not isinstance(gateway, ipaddress.IPv4Address):
+                raise ValueError("gateway is not IPv4")
+            if interface.network.num_addresses > MAX_FLOAT_IPS + 2:
+                raise ValueError("subnet is too large")
+        except ValueError as exc:
+            print(f"[!] Ignoring invalid floating subnet {definition!r}: {exc}")
+            continue
+
+        first_allowed = int(interface.ip)
+        for address in interface.network.hosts():
+            if int(address) < first_allowed or address == gateway:
+                continue
+            value = str(address)
+            if value not in seen:
+                seen.add(value)
+                addresses.append(value)
+                if len(addresses) >= MAX_FLOAT_IPS:
+                    return addresses
+    return addresses
+
+
+def fetch_managed_float_profile():
+    """Fetch this host's current floating-IP pool from the central database."""
+    host_ip = primary_source_ipv4()
+    separator = "&" if "?" in FLOAT_IP_API_URL else "?"
+    url = FLOAT_IP_API_URL + separator + urlencode({"host_ip": host_ip})
+    request = urllib.request.Request(url, headers={"User-Agent": "XD-route-ads/3"})
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload_raw = response.read(2 * 1024 * 1024 + 1)
+            if len(payload_raw) > 2 * 1024 * 1024:
+                raise RuntimeError("floating-IP API response is too large")
+            payload = json.loads(payload_raw.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise RuntimeError(f"floating-IP API returned HTTP {exc.code}") from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"floating-IP API request failed: {exc}") from exc
+
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise RuntimeError("floating-IP API returned an invalid payload")
+
+    try:
+        host_id = int(payload["host_id"])
+        returned_host_ip = str(ipaddress.ip_address(str(payload["host_ip"])))
+        public_interface = str(payload["public_interface"]).strip()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("floating-IP API response is missing required fields") from exc
+
+    creator = str(payload.get("creator", "")).strip().lower()
+    if host_id <= 0 or returned_host_ip != host_ip:
+        raise RuntimeError("floating-IP API returned a mismatched host")
+    if creator not in {"float", "floating", "floating_ip", "float_ip"}:
+        raise RuntimeError("floating-IP API returned a non-floating host")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", public_interface):
+        raise RuntimeError("floating-IP API returned an invalid interface")
+
+    addresses = expand_ip_pool(payload.get("ip_pool_csv", ""))
+    if not addresses:
+        addresses = expand_subnet_definitions(payload.get("subnet_definitions", ""))
+    addresses = [address for address in addresses if address != host_ip]
+    if not addresses:
+        raise RuntimeError("floating-IP database pool is empty")
+
+    return {
+        "host_id": host_id,
+        "host_ip": host_ip,
+        "public_interface": public_interface,
+        "addresses": addresses,
+        "pool_sha256": str(payload.get("pool_sha256", "")),
+    }
+
+
+def ensure_float_sync_service(profile):
+    host_id = profile["host_id"]
+    interface = profile["public_interface"]
+    addresses = sorted(set(profile["addresses"]), key=lambda value: int(ipaddress.ip_address(value)))
+    FLOAT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(FLOAT_STATE_DIR, 0o700)
+
+    sync_script = """#!/bin/sh
+set -eu
+host_id="$1"
+interface="$2"
+state="/etc/xd-dedicated-float/host-${host_id}.ips"
+test -s "$state"
+ip link show "$interface" >/dev/null
+ip link set "$interface" up
+while IFS= read -r address; do
+    test -n "$address" || continue
+    ip addr replace "${address}/32" dev "$interface"
+done < "$state"
+"""
+    script_changed = write_text_if_changed(FLOAT_SYNC_SCRIPT_PATH, sync_script, mode=0o700)
+
+    state_path = FLOAT_STATE_DIR / f"host-{host_id}.ips"
+    state_changed = write_text_if_changed(
+        state_path,
+        "".join(f"{address}\n" for address in addresses),
+        mode=0o600,
+    )
+
+    unit = f"{FLOAT_SERVICE_PREFIX}{host_id}.service"
+    unit_path = FLOAT_UNIT_DIR / unit
+    unit_content = f"""[Unit]
+Description=Direct floating IPs for dedicated host {host_id}
+After=network-online.target stunnel4.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={FLOAT_SYNC_SCRIPT_PATH} {host_id} {interface}
+
+[Install]
+WantedBy=multi-user.target
+"""
+    unit_changed = write_text_if_changed(unit_path, unit_content, mode=0o644)
+    if script_changed or unit_changed:
+        run_cmd("systemctl daemon-reload", check=True)
+    run_cmd(f"systemctl enable {shlex.quote(unit)}", check=True)
+
+    if state_changed:
+        print(
+            f"[+] Floating-IP state updated from DB: host={host_id}, "
+            f"addresses={len(addresses)}, hash={profile['pool_sha256'][:12] or 'n/a'}"
+        )
+    return state_changed
+
+
+def sync_managed_floating_ips_from_database():
+    """Sync DB state, then restore only missing addresses; never remove live IPs."""
+    try:
+        profile = fetch_managed_float_profile()
+        if profile is not None:
+            ensure_float_sync_service(profile)
+    except Exception as exc:
+        print(f"[!] Floating-IP DB sync failed; preserving cached state: {exc}")
+    return refresh_managed_floating_ips()
+
+
+def current_global_ipv4_addresses():
+    result = subprocess.run(
+        ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "could not list global IPv4 addresses")
+    return set(re.findall(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/\d+", result.stdout))
+
+
+def refresh_managed_floating_ips():
+    """Restore missing managed IPs without deleting any address from the host."""
+    states = load_managed_float_states()
+    if not states:
+        return True
+
+    try:
+        current = current_global_ipv4_addresses()
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        print(f"[!] Floating-IP check failed: {exc}")
+        return False
+
+    missing_by_host = {
+        host_id: addresses - current
+        for host_id, addresses in states.items()
+        if addresses - current
+    }
+    if not missing_by_host:
+        return True
+
+    missing_count = sum(len(addresses) for addresses in missing_by_host.values())
+    print(f"[!] Restoring {missing_count} missing managed floating IP(s).")
+    for host_id in sorted(missing_by_host, key=int):
+        unit = f"{FLOAT_SERVICE_PREFIX}{host_id}.service"
+        result = run_cmd(f"systemctl restart {shlex.quote(unit)}")
+        if result is None or result.returncode != 0:
+            print(f"[!] Could not refresh floating IPs through {unit}.")
+
+    try:
+        current = current_global_ipv4_addresses()
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        print(f"[!] Floating-IP verification failed: {exc}")
+        return False
+
+    expected = set().union(*states.values())
+    remaining = expected - current
+    if remaining:
+        print(f"[!] {len(remaining)} managed floating IP(s) are still missing.")
+        return False
+    print(f"[+] Restored all {missing_count} missing managed floating IP(s).")
     return True
 
 
@@ -295,11 +632,23 @@ def discover_vpn_subnets():
 
 # ---------------- ipset ----------------
 def setup_ipset():
-    run_cmd(
+    result = run_cmd(
         f"ipset create {shlex.quote(IPSET_NAME)} hash:ip "
         "family inet hashsize 4096 maxelem 1048576 -exist",
-        check=True,
     )
+    if result is not None and result.returncode == 0:
+        return
+
+    existing = subprocess.run(
+        ["ipset", "list", IPSET_NAME],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if existing.returncode == 0 and re.search(r"^Type:\s+hash:ip\s*$", existing.stdout, re.MULTILINE):
+        print("[!] Preserving the existing compatible proxylist ipset parameters.")
+        return
+    raise RuntimeError(f"unable to create or reuse the {IPSET_NAME} ipset")
 
 
 # ---------------- dnsmasq ----------------
@@ -570,6 +919,9 @@ def redact_proxy(proxy_url):
 
 def create_systemd_service():
     global SOCKS_PROXY
+    # Proxy refresh and floating-IP refresh share one lifecycle entry point.
+    # The database remains authoritative; cached state is only a safe fallback.
+    sync_managed_floating_ips_from_database()
     SOCKS_PROXY = fetch_proxy_url()
     systemd_proxy = SOCKS_PROXY.replace("%", "%%")
     print(f"[+] Using proxy: {redact_proxy(SOCKS_PROXY)}")
@@ -738,6 +1090,8 @@ def health_loop(initial_subnets):
     while True:
         time.sleep(HEALTH_INTERVAL_SECONDS)
         try:
+            if load_managed_float_states():
+                sync_managed_floating_ips_from_database()
             current_subnets = discover_vpn_subnets()
             if not service_is_active("dnsmasq.service"):
                 setup_ipset()
