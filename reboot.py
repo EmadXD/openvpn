@@ -36,6 +36,12 @@ TUN_ADDR = "192.168.255.1/24"
 
 
 def create_systemd_service():
+    # route_ads_new.py owns every tun2socks lane in multi-proxy mode. Keeping
+    # this legacy refresh as a no-op prevents a periodic downgrade to one
+    # proxy while preserving the old behavior on servers not yet upgraded.
+    if os.path.exists("/etc/xd-tun2socks/multi.enabled"):
+        print("[+] Multi-proxy tun2socks is managed by route_ads_new.py")
+        return
     try:
         SOCKS_PROXY = requests.get("https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX").text
         SOCKS_PROXY = clean_proxy_url(SOCKS_PROXY)
@@ -52,7 +58,7 @@ Type=simple
 ExecStartPre=/bin/bash -c 'ip link show {TUN_DEV} >/dev/null 2>&1 || ip tuntap add dev {TUN_DEV} mode tun'
 ExecStartPre=/bin/bash -c 'ip addr show dev {TUN_DEV} | grep -q "{TUN_ADDR.split("/")[0]}" || ip addr add {TUN_ADDR} dev {TUN_DEV}'
 ExecStartPre=/sbin/ip link set {TUN_DEV} up
-ExecStart=/opt/tun2socks -device {TUN_DEV} -proxy {SOCKS_PROXY} -loglevel error
+ExecStart=/opt/tun2socks --device {TUN_DEV} --proxy {SOCKS_PROXY} --loglevel error
 Restart=always
 RestartSec=3
 
