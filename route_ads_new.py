@@ -38,7 +38,7 @@ PROXY_REFRESH_SECONDS = 300
 MARK_CHAIN = "XD_T2S_MARK"
 FORWARD_CHAIN = "XD_T2S_FWD"
 NAT_CHAIN = "XD_T2S_NAT"
-RECONCILE_INTERVAL_SECONDS = 60
+RECONCILE_INTERVAL_SECONDS = 300
 PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX"
 FLOAT_IP_API_URL = "https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=XXX"
 TUN2SOCKS_BINARY_URL = "https://aparatvpn.com/tun2socks"
@@ -105,6 +105,12 @@ DOMAINS = [
     "stun3.l.google.com",
     "stun4.l.google.com",
 ]
+
+# Some clients resolve through browser DNS cache or DoH, so dnsmasq never sees
+# their query. Resolve critical route domains locally as well and seed ipset.
+IPSET_PREWARM_DOMAINS = tuple(dict.fromkeys(
+    DOMAINS + ["www.browserleaks.com", "tls.browserleaks.com"]
+))
 
 FULL_ROUTE_TO_PROXY = True
 block_udp = True
@@ -660,6 +666,47 @@ def setup_ipset():
         print("[!] Preserving the existing compatible proxylist ipset parameters.")
         return
     raise RuntimeError(f"unable to create or reuse the {IPSET_NAME} ipset")
+
+
+def refresh_proxy_ipset():
+    resolved_ips = set()
+    try:
+        lookup = subprocess.run(
+            ["getent", "ahostsv4", *IPSET_PREWARM_DOMAINS],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[!] Proxy ipset prewarm lookup failed: {exc}")
+        return
+
+    for line in lookup.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        try:
+            address = ipaddress.ip_address(fields[0])
+        except ValueError:
+            continue
+        if isinstance(address, ipaddress.IPv4Address):
+            resolved_ips.add(str(address))
+
+    added = 0
+    for address in sorted(resolved_ips):
+        result = subprocess.run(
+            ["ipset", "add", IPSET_NAME, address, "-exist"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            added += 1
+
+    print(
+        f"[+] Proxy ipset prewarm: {added} IPv4 addresses for "
+        f"{len(IPSET_PREWARM_DOMAINS)} configured domains"
+    )
 
 
 # ---------------- dnsmasq ----------------
@@ -1384,6 +1431,7 @@ def reconcile_loop(initial_subnets, initial_lanes, initial_route_lanes):
             if not service_is_active("dnsmasq.service"):
                 setup_ipset()
                 run_cmd("systemctl restart dnsmasq.service", check=True)
+            refresh_proxy_ipset()
 
             proxy_list_changed = False
             if time.monotonic() - last_proxy_refresh >= PROXY_REFRESH_SECONDS:
@@ -1453,6 +1501,7 @@ def main():
     setup_ipset()
     setup_dnsmasq()
     use_local_dnsmasq()
+    refresh_proxy_ipset()
     sync_managed_floating_ips_from_database()
     proxy_records = fetch_proxy_records()
     configured_lanes, started_lanes = prepare_proxy_lanes(proxy_records)
