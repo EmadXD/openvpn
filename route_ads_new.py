@@ -1082,6 +1082,19 @@ def discover_vpn_dns_routes():
 
 # ---------------- ipset ----------------
 def setup_ipset():
+    # Older installations used hash:net. It accepts individual IPv4 entries too,
+    # so preserve either compatible type instead of replacing a referenced set.
+    existing = subprocess.run(
+        ["ipset", "list", IPSET_NAME],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if existing.returncode == 0 and re.search(
+        r"^Type:\s+hash:(?:ip|net)\s*$", existing.stdout, re.MULTILINE
+    ):
+        return
+
     result = run_cmd(
         f"ipset create {shlex.quote(IPSET_NAME)} hash:ip "
         "family inet hashsize 4096 maxelem 1048576 -exist",
@@ -1095,8 +1108,10 @@ def setup_ipset():
         text=True,
         timeout=20,
     )
-    if existing.returncode == 0 and re.search(r"^Type:\s+hash:ip\s*$", existing.stdout, re.MULTILINE):
-        print("[!] Preserving the existing compatible proxylist ipset parameters.")
+    if existing.returncode == 0 and re.search(
+        r"^Type:\s+hash:(?:ip|net)\s*$", existing.stdout, re.MULTILINE
+    ):
+        print("[!] Reusing the proxylist ipset created by another process.")
         return
     raise RuntimeError(f"unable to create or reuse the {IPSET_NAME} ipset")
 
