@@ -38,6 +38,15 @@ PROXY_REFRESH_SECONDS = 300
 MARK_CHAIN = "XD_T2S_MARK"
 FORWARD_CHAIN = "XD_T2S_FWD"
 NAT_CHAIN = "XD_T2S_NAT"
+DNS_NAT_CHAIN = "XD_T2S_DNS"
+DNS_INPUT_CHAIN = "XD_T2S_DNS_IN"
+DNS_REDIRECT_ADDRESS = "10.8.0.1"
+DNS_WORKER_PREFIX = "xd-dnsmasq-"
+DNS_WORKER_CONFIG_DIR = Path("/etc/xd-dnsmasq")
+DNS_CACHE_SIZE = 10000
+DNS_FORWARD_MAX = 4096
+ENFORCE_VPN_DNS = True
+BLOCK_DNS_OVER_TLS = True
 RECONCILE_INTERVAL_SECONDS = 300
 PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX"
 FLOAT_IP_API_URL = "https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=XXX"
@@ -57,14 +66,18 @@ DOMAINS = [
     "2mdn.net",
     "ad.doubleclick.net",
     "adclick.g.doubleclick.net",
+    "admob-gmats.uc.r.appspot.com",
     "admob-api.google.com",
     "admob-cn.com",
     "admob.com",
     "admob.google.com",
     "admob.googleapis.com",
+    "adtrafficquality.google",
     "adservice.google.com",
+    "adservice.google.com.ae",
     "adservices.google.com",
     "adsense.com",
+    "adsensecustomsearchads.com",
     "analytics.google.com",
     "app-measurement-cn.com",
     "app-measurement.com",
@@ -73,18 +86,33 @@ DOMAINS = [
     "dartsearch.net",
     "developers.google.com",
     "doubleclick-cn.net",
+    "doubleclick.de",
+    "doubleclick.ne.jp",
     "doubleclick.net",
     "doubleclick.com",
+    "doubleclickbygoogle.com",
     "firebase.google.com",
+    "fundingchoicesmessages.google.com",
     "g.doubleclick.net",
+    "google-analytics-cn.com",
     "google-analytics.com",
+    "googleadservices-cn.com",
     "googleadservices.com",
+    "googleads-cn.com",
     "googleads.com",
+    "googleadsserving.cn",
+    "googleapis.cn",
     "googleapis.com",
+    "googlesyndication-cn.com",
     "googlesyndication.com",
+    "googletagmanager-cn.com",
     "googletagmanager.com",
     "googletagservices.com",
+    "gstatic-cn.com",
+    "gstatic.cn",
     "gstatic.com",
+    "gvt1.com",
+    "mobileads.google.com",
     "pagead2.googlesyndication.com",
     "play.googleapis.com",
     "pubads.g.doubleclick.net",
@@ -95,7 +123,16 @@ DOMAINS = [
     "stats.g.doubleclick.net",
     "pagead.l.doubleclick.net",
     "googleusercontent.com",
+    "merchant-center-analytics.goog",
+    "mediation.goog",
     "ssl.google-analytics.com",
+    "syndicatedsearch.goog",
+    "tagassistant.google.com",
+    "tagmanager.google.com",
+    "www.google.com",
+    "redirector.googlevideo.com",
+    "i.ytimg.com",
+    "yt3.ggpht.com",
 
     "browserleaks.com", "aparatvpn.com",
 
@@ -106,10 +143,365 @@ DOMAINS = [
     "stun4.l.google.com",
 ]
 
+# dnsmasq matches a configured domain and its subdomains, but it cannot match
+# the same label across arbitrary TLDs. Keep Google's published regional
+# adservice endpoints explicit and auditable. Source (2026-09-03):
+# https://www.google.com/supported_domains
+IPSET_PREWARM_BASE_DOMAINS = tuple(DOMAINS)
+GOOGLE_ADSERVICE_REGIONAL_DOMAINS = """
+adservice.google.ad
+adservice.google.ae
+adservice.google.al
+adservice.google.am
+adservice.google.as
+adservice.google.at
+adservice.google.az
+adservice.google.ba
+adservice.google.be
+adservice.google.bf
+adservice.google.bg
+adservice.google.bi
+adservice.google.bj
+adservice.google.bs
+adservice.google.bt
+adservice.google.by
+adservice.google.ca
+adservice.google.cat
+adservice.google.cd
+adservice.google.cf
+adservice.google.cg
+adservice.google.ch
+adservice.google.ci
+adservice.google.cl
+adservice.google.cm
+adservice.google.cn
+adservice.google.co.ao
+adservice.google.co.bw
+adservice.google.co.ck
+adservice.google.co.cr
+adservice.google.co.id
+adservice.google.co.il
+adservice.google.co.in
+adservice.google.co.jp
+adservice.google.co.ke
+adservice.google.co.kr
+adservice.google.co.ls
+adservice.google.co.ma
+adservice.google.co.mz
+adservice.google.co.nz
+adservice.google.co.th
+adservice.google.co.tz
+adservice.google.co.ug
+adservice.google.co.uk
+adservice.google.co.uz
+adservice.google.co.ve
+adservice.google.co.vi
+adservice.google.co.za
+adservice.google.co.zm
+adservice.google.co.zw
+adservice.google.com
+adservice.google.com.af
+adservice.google.com.ag
+adservice.google.com.ar
+adservice.google.com.au
+adservice.google.com.bd
+adservice.google.com.bh
+adservice.google.com.bn
+adservice.google.com.bo
+adservice.google.com.br
+adservice.google.com.bz
+adservice.google.com.co
+adservice.google.com.cu
+adservice.google.com.cy
+adservice.google.com.do
+adservice.google.com.ec
+adservice.google.com.eg
+adservice.google.com.et
+adservice.google.com.fj
+adservice.google.com.gh
+adservice.google.com.gi
+adservice.google.com.gt
+adservice.google.com.hk
+adservice.google.com.jm
+adservice.google.com.kh
+adservice.google.com.kw
+adservice.google.com.lb
+adservice.google.com.ly
+adservice.google.com.mm
+adservice.google.com.mt
+adservice.google.com.mx
+adservice.google.com.my
+adservice.google.com.na
+adservice.google.com.ng
+adservice.google.com.ni
+adservice.google.com.np
+adservice.google.com.om
+adservice.google.com.pa
+adservice.google.com.pe
+adservice.google.com.pg
+adservice.google.com.ph
+adservice.google.com.pk
+adservice.google.com.pr
+adservice.google.com.py
+adservice.google.com.qa
+adservice.google.com.sa
+adservice.google.com.sb
+adservice.google.com.sg
+adservice.google.com.sl
+adservice.google.com.sv
+adservice.google.com.tj
+adservice.google.com.tr
+adservice.google.com.tw
+adservice.google.com.ua
+adservice.google.com.uy
+adservice.google.com.vc
+adservice.google.com.vn
+adservice.google.cv
+adservice.google.cz
+adservice.google.de
+adservice.google.dj
+adservice.google.dk
+adservice.google.dm
+adservice.google.dz
+adservice.google.ee
+adservice.google.es
+adservice.google.fi
+adservice.google.fm
+adservice.google.fr
+adservice.google.ga
+adservice.google.ge
+adservice.google.gg
+adservice.google.gl
+adservice.google.gm
+adservice.google.gr
+adservice.google.gy
+adservice.google.hn
+adservice.google.hr
+adservice.google.ht
+adservice.google.hu
+adservice.google.ie
+adservice.google.im
+adservice.google.iq
+adservice.google.is
+adservice.google.it
+adservice.google.je
+adservice.google.jo
+adservice.google.kg
+adservice.google.ki
+adservice.google.kz
+adservice.google.la
+adservice.google.li
+adservice.google.lk
+adservice.google.lt
+adservice.google.lu
+adservice.google.lv
+adservice.google.md
+adservice.google.me
+adservice.google.mg
+adservice.google.mk
+adservice.google.ml
+adservice.google.mn
+adservice.google.mu
+adservice.google.mv
+adservice.google.mw
+adservice.google.ne
+adservice.google.nl
+adservice.google.no
+adservice.google.nr
+adservice.google.nu
+adservice.google.pl
+adservice.google.pn
+adservice.google.ps
+adservice.google.pt
+adservice.google.ro
+adservice.google.rs
+adservice.google.ru
+adservice.google.rw
+adservice.google.sc
+adservice.google.se
+adservice.google.sh
+adservice.google.si
+adservice.google.sk
+adservice.google.sm
+adservice.google.sn
+adservice.google.so
+adservice.google.sr
+adservice.google.st
+adservice.google.td
+adservice.google.tg
+adservice.google.tl
+adservice.google.tm
+adservice.google.tn
+adservice.google.to
+adservice.google.tt
+adservice.google.vu
+adservice.google.ws
+""".split()
+
+# Regional roots in ad-specific Google families. Each entry was verified
+# against authoritative DNS with a Google-operated SOA on 2026-09-03.
+GOOGLE_OWNED_REGIONAL_AD_DOMAINS = """
+2mdn.com
+admob.co.id
+admob.co.in
+admob.co.kr
+admob.co.nz
+admob.co.uk
+admob.co.za
+admob.com
+admob.com.au
+admob.com.br
+admob.com.hk
+admob.com.mx
+admob.com.my
+admob.com.ph
+admob.com.sg
+admob.com.tr
+admob.com.tw
+admob.com.vn
+admob.de
+admob.dk
+admob.es
+admob.fi
+admob.fr
+admob.gr
+admob.ie
+admob.it
+admob.me
+admob.mg
+admob.nl
+admob.no
+admob.pt
+admob.so
+doubleclick.al
+doubleclick.am
+doubleclick.as
+doubleclick.by
+doubleclick.cd
+doubleclick.cf
+doubleclick.cg
+doubleclick.ch
+doubleclick.cn
+doubleclick.co.ck
+doubleclick.co.id
+doubleclick.co.jp
+doubleclick.co.uk
+doubleclick.co.vi
+doubleclick.com
+doubleclick.com.ag
+doubleclick.com.et
+doubleclick.com.gt
+doubleclick.com.hk
+doubleclick.com.mt
+doubleclick.com.mx
+doubleclick.com.pa
+doubleclick.com.pr
+doubleclick.com.sb
+doubleclick.com.sv
+doubleclick.com.tw
+doubleclick.de
+doubleclick.dk
+doubleclick.dm
+doubleclick.fr
+doubleclick.ga
+doubleclick.gm
+doubleclick.lk
+doubleclick.lt
+doubleclick.lv
+doubleclick.mg
+doubleclick.mw
+doubleclick.nl
+doubleclick.pl
+doubleclick.rw
+doubleclick.sh
+doubleclick.so
+doubleclick.sr
+doubleclick.st
+googleads.ae
+googleads.al
+googleads.as
+googleads.az
+googleads.bg
+googleads.by
+googleads.cd
+googleads.ci
+googleads.cl
+googleads.cm
+googleads.co.cr
+googleads.co.ke
+googleads.co.ma
+googleads.co.mz
+googleads.co.uz
+googleads.co.ve
+googleads.com
+googleads.com.ag
+googleads.com.au
+googleads.com.bo
+googleads.com.do
+googleads.com.ec
+googleads.com.gt
+googleads.com.hk
+googleads.com.jm
+googleads.com.mt
+googleads.com.ng
+googleads.com.om
+googleads.com.pe
+googleads.com.ph
+googleads.com.pk
+googleads.com.pr
+googleads.com.sg
+googleads.com.sv
+googleads.com.ua
+googleads.fm
+googleads.ga
+googleads.gg
+googleads.gl
+googleads.gy
+googleads.hn
+googleads.hr
+googleads.im
+googleads.je
+googleads.jo
+googleads.kg
+googleads.la
+googleads.li
+googleads.mn
+googleads.mu
+googleads.mw
+googleads.ps
+googleads.sc
+googleads.sh
+googleads.so
+googleads.st
+googleads.tg
+googleads.tl
+googleads.tm
+googleads.tn
+googleads.to
+googleads.tt
+googleads.ws
+googleadservices.com
+googleadsserving.cn
+googlesyndication.ca
+googlesyndication.cn
+googlesyndication.co.uk
+googlesyndication.com
+googlesyndication.com.au
+googlesyndication.com.br
+googlesyndication.it
+""".split()
+
+DOMAINS = list(dict.fromkeys(
+    DOMAINS
+    + GOOGLE_ADSERVICE_REGIONAL_DOMAINS
+    + GOOGLE_OWNED_REGIONAL_AD_DOMAINS
+))
+
 # Some clients resolve through browser DNS cache or DoH, so dnsmasq never sees
 # their query. Resolve critical route domains locally as well and seed ipset.
 IPSET_PREWARM_DOMAINS = tuple(dict.fromkeys(
-    DOMAINS + ["www.browserleaks.com", "tls.browserleaks.com"]
+    list(IPSET_PREWARM_BASE_DOMAINS)
+    + ["www.browserleaks.com", "tls.browserleaks.com"]
 ))
 
 FULL_ROUTE_TO_PROXY = True
@@ -598,7 +990,7 @@ def setup_install_packages():
         print(f"[+] Installed tun2socks ({tun2socks_path.stat().st_size} bytes).")
 
 
-def discover_vpn_subnets():
+def discover_vpn_networks():
     networks = set()
     config_paths = set(glob.glob("/etc/openvpn/server*.conf"))
     config_paths.update(glob.glob("/etc/openvpn/server/*.conf"))
@@ -636,6 +1028,12 @@ def discover_vpn_subnets():
     if not networks:
         networks.add(ipaddress.ip_network(LEGACY_VPN_SUBNET))
 
+    return sorted(networks, key=lambda item: (int(item.network_address), item.prefixlen))
+
+
+def discover_vpn_subnets():
+    networks = discover_vpn_networks()
+
     # Collapse only exactly adjacent/overlapping networks. On a multi-instance
     # host this turns 10.8/16..10.23/16 into two exact /13 rules instead of
     # making every packet walk sixteen equivalent iptables rules.
@@ -645,6 +1043,41 @@ def discover_vpn_subnets():
     )
     print("[+] OpenVPN subnets: " + ", ".join(str(item) for item in result))
     return [str(item) for item in result]
+
+
+def discover_vpn_dns_routes():
+    try:
+        output = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout
+        local_addresses = set(re.findall(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/\d+", output))
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[!] Could not inspect local DNS addresses: {exc}")
+        local_addresses = set()
+
+    routes = []
+    for network in discover_vpn_networks():
+        try:
+            gateway = str(next(network.hosts()))
+        except StopIteration:
+            continue
+        if gateway in local_addresses:
+            routes.append({"subnet": str(network), "address": gateway})
+
+    if not routes and DNS_REDIRECT_ADDRESS in local_addresses:
+        routes.append({"subnet": LEGACY_VPN_SUBNET, "address": DNS_REDIRECT_ADDRESS})
+    if not routes:
+        raise RuntimeError("no active OpenVPN DNS gateway was found")
+
+    print(
+        "[+] OpenVPN DNS workers: "
+        + ", ".join(f"{item['subnet']}->{item['address']}" for item in routes)
+    )
+    return routes
 
 
 # ---------------- ipset ----------------
@@ -710,12 +1143,87 @@ def refresh_proxy_ipset():
 
 
 # ---------------- dnsmasq ----------------
-def setup_dnsmasq():
-    dnsmasq_main = """port=53
-listen-address=127.0.0.1,10.8.0.1
+def dns_worker_token(address):
+    return address.replace(".", "-")
+
+
+def dns_worker_unit(address):
+    return f"{DNS_WORKER_PREFIX}{dns_worker_token(address)}.service"
+
+
+def dns_primary_address(dns_routes):
+    addresses = [item["address"] for item in dns_routes]
+    if DNS_REDIRECT_ADDRESS in addresses:
+        return DNS_REDIRECT_ADDRESS
+    return addresses[0]
+
+
+def dns_worker_config(address):
+    token = dns_worker_token(address)
+    return f"""port=53
+listen-address={address}
+bind-interfaces
+user=dnsmasq
+pid-file=/run/{DNS_WORKER_PREFIX}{token}.pid
+no-resolv
+server=1.1.1.1
+server=1.0.0.1
+cache-size={DNS_CACHE_SIZE}
+dns-forward-max={DNS_FORWARD_MAX}
+conf-file=/etc/dnsmasq.d/ipset.conf
+"""
+
+
+def dns_worker_service(address, config_path):
+    return f"""[Unit]
+Description=XD dnsmasq worker for {address}
+Wants=network-online.target
+After=network-online.target dnsmasq.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file={config_path}
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def cleanup_stale_dns_workers(active_addresses):
+    active_tokens = {dns_worker_token(address) for address in active_addresses}
+    changed = False
+    for unit_path in Path("/etc/systemd/system").glob(f"{DNS_WORKER_PREFIX}*.service"):
+        token = unit_path.name[len(DNS_WORKER_PREFIX):-len(".service")]
+        if token in active_tokens:
+            continue
+        run_cmd(f"systemctl disable --now {shlex.quote(unit_path.name)}")
+        try:
+            unit_path.unlink()
+            changed = True
+        except OSError:
+            pass
+        config_path = DNS_WORKER_CONFIG_DIR / f"{token}.conf"
+        try:
+            config_path.unlink()
+        except OSError:
+            pass
+    if changed:
+        run_cmd("systemctl daemon-reload", check=True)
+
+
+def setup_dnsmasq(dns_routes):
+    primary_address = dns_primary_address(dns_routes)
+    dnsmasq_main = f"""port=53
+listen-address=127.0.0.1,{primary_address}
 bind-dynamic
 conf-dir=/etc/dnsmasq.d/,*.conf
-dns-forward-max=999999
+no-resolv
+cache-size={DNS_CACHE_SIZE}
+dns-forward-max={DNS_FORWARD_MAX}
 """
     ipset_config = "".join(
         f"ipset=/{domain}/{IPSET_NAME}\n" for domain in DOMAINS
@@ -731,6 +1239,48 @@ server=1.0.0.1
     run_cmd("systemctl enable dnsmasq", check=True)
     if changed or not service_is_active("dnsmasq.service"):
         run_cmd("systemctl restart dnsmasq", check=True)
+
+    DNS_WORKER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DNS_WORKER_CONFIG_DIR, 0o755)
+    worker_addresses = [
+        item["address"] for item in dns_routes if item["address"] != primary_address
+    ]
+    cleanup_stale_dns_workers(worker_addresses)
+
+    daemon_reload = False
+    changed_units = set()
+    for address in worker_addresses:
+        token = dns_worker_token(address)
+        config_path = DNS_WORKER_CONFIG_DIR / f"{token}.conf"
+        unit = dns_worker_unit(address)
+        unit_path = Path("/etc/systemd/system") / unit
+        config_changed = write_text_if_changed(
+            config_path, dns_worker_config(address), mode=0o644
+        )
+        unit_changed = write_text_if_changed(
+            unit_path, dns_worker_service(address, config_path), mode=0o644
+        )
+        run_cmd(f"dnsmasq --test --conf-file={shlex.quote(str(config_path))}", check=True)
+        if unit_changed:
+            daemon_reload = True
+        if config_changed or unit_changed:
+            changed_units.add(unit)
+
+    if daemon_reload:
+        run_cmd("systemctl daemon-reload", check=True)
+    for address in worker_addresses:
+        unit = dns_worker_unit(address)
+        run_cmd(f"systemctl enable {shlex.quote(unit)}", check=True)
+        action = "restart" if unit in changed_units else "start"
+        run_cmd(f"systemctl {action} {shlex.quote(unit)}", check=True)
+
+    if not dns_workers_are_ready(dns_routes):
+        raise RuntimeError("one or more OpenVPN DNS workers failed to start")
+    print(
+        f"[+] DNS load is distributed across {len(dns_routes)} "
+        f"OpenVPN gateway(s); primary={primary_address}"
+    )
+    return primary_address
 
 
 # ---------------- tun2socks interfaces ----------------
@@ -827,13 +1377,47 @@ def remove_legacy_rules():
     remove_rule_all("mangle", "PREROUTING", ["-j", "TUN2SOCKS"])
 
 
-def setup_vpn_forwarding(vpn_subnets):
+def setup_vpn_forwarding(vpn_subnets, dns_routes):
     ensure_chain("filter", FORWARD_CHAIN)
     ensure_jump("filter", "FORWARD", FORWARD_CHAIN)
     ensure_chain("nat", NAT_CHAIN)
     ensure_jump("nat", "POSTROUTING", NAT_CHAIN)
 
+    if ENFORCE_VPN_DNS:
+        ensure_chain("nat", DNS_NAT_CHAIN)
+        ensure_jump("nat", "PREROUTING", DNS_NAT_CHAIN)
+        ensure_chain("filter", DNS_INPUT_CHAIN)
+        ensure_jump("filter", "INPUT", DNS_INPUT_CHAIN)
+
+    if ENFORCE_VPN_DNS:
+        for route in dns_routes:
+            subnet = route["subnet"]
+            address = route["address"]
+            for protocol in ("udp", "tcp"):
+                iptables_call("nat", [
+                    "-A", DNS_NAT_CHAIN, "-s", subnet,
+                    "-p", protocol, "--dport", "53",
+                    "-j", "DNAT", "--to-destination", f"{address}:53",
+                ], check=True)
+                iptables_call("filter", [
+                    "-A", DNS_INPUT_CHAIN, "-s", subnet, "-d", address,
+                    "-p", protocol, "--dport", "53", "-j", "ACCEPT",
+                ], check=True)
+
     for subnet in vpn_subnets:
+
+        if BLOCK_DNS_OVER_TLS:
+            iptables_call("filter", [
+                "-A", FORWARD_CHAIN, "-s", subnet,
+                "-p", "tcp", "--dport", "853",
+                "-j", "REJECT", "--reject-with", "tcp-reset",
+            ], check=True)
+            iptables_call("filter", [
+                "-A", FORWARD_CHAIN, "-s", subnet,
+                "-p", "udp", "--dport", "853",
+                "-j", "REJECT", "--reject-with", "icmp-port-unreachable",
+            ], check=True)
+
         # Keep the legacy interface accepted as a rollback path while the
         # multipath route is switched atomically by `ip route replace`.
         for output_interface in (f"{MULTI_TUN_PREFIX}+", TUN_DEV):
@@ -858,6 +1442,16 @@ def setup_iptables_fwmark(vpn_subnets):
     ensure_jump("mangle", "PREROUTING", MARK_CHAIN)
 
     for subnet in vpn_subnets:
+        if ENFORCE_VPN_DNS:
+            # DNS is redirected to the local dnsmasq in nat/PREROUTING. It
+            # must not inherit a proxy mark (or the UDP guard would drop it)
+            # before DNAT gets a chance to run.
+            for protocol in ("udp", "tcp"):
+                iptables_call("mangle", [
+                    "-A", MARK_CHAIN, "-s", subnet,
+                    "-p", protocol, "--dport", "53", "-j", "RETURN",
+                ], check=True)
+
         mark_rule = ["-A", MARK_CHAIN, "-s", subnet]
         if not FULL_ROUTE_TO_PROXY:
             mark_rule.extend([
@@ -1294,23 +1888,71 @@ def prepare_dnsmasq_install():
     )
 
 
-def use_local_dnsmasq():
+def use_local_dnsmasq(address=DNS_REDIRECT_ADDRESS):
     run_cmd("systemctl disable --now systemd-resolved 2>/dev/null || true")
     try:
         Path("/etc/resolv.conf").unlink(missing_ok=True)
     except OSError:
         pass
-    write_text_if_changed("/etc/resolv.conf", "nameserver 10.8.0.1\n")
+    write_text_if_changed("/etc/resolv.conf", f"nameserver {address}\n")
 
 
-def firewall_rules_present(vpn_subnets):
+def firewall_rules_present(vpn_subnets, dns_routes):
     if iptables_call("mangle", ["-C", "PREROUTING", "-j", MARK_CHAIN]).returncode != 0:
         return False
     if iptables_call("filter", ["-C", "FORWARD", "-j", FORWARD_CHAIN]).returncode != 0:
         return False
     if iptables_call("nat", ["-C", "POSTROUTING", "-j", NAT_CHAIN]).returncode != 0:
         return False
+    if ENFORCE_VPN_DNS:
+        if iptables_call("nat", ["-C", "PREROUTING", "-j", DNS_NAT_CHAIN]).returncode != 0:
+            return False
+        if iptables_call("filter", ["-C", "INPUT", "-j", DNS_INPUT_CHAIN]).returncode != 0:
+            return False
+        for route in dns_routes:
+            subnet = route["subnet"]
+            address = route["address"]
+            for protocol in ("udp", "tcp"):
+                dns_redirect = [
+                    "-s", subnet, "-p", protocol, "--dport", "53",
+                    "-j", "DNAT", "--to-destination", f"{address}:53",
+                ]
+                dns_accept = [
+                    "-s", subnet, "-d", address,
+                    "-p", protocol, "--dport", "53", "-j", "ACCEPT",
+                ]
+                if any((
+                    iptables_call("nat", ["-C", DNS_NAT_CHAIN] + dns_redirect).returncode != 0,
+                    iptables_call("filter", ["-C", DNS_INPUT_CHAIN] + dns_accept).returncode != 0,
+                )):
+                    return False
     for subnet in vpn_subnets:
+        if ENFORCE_VPN_DNS:
+            for protocol in ("udp", "tcp"):
+                dns_return = [
+                    "-s", subnet, "-p", protocol,
+                    "--dport", "53", "-j", "RETURN",
+                ]
+                if iptables_call(
+                    "mangle", ["-C", MARK_CHAIN] + dns_return
+                ).returncode != 0:
+                    return False
+
+        if BLOCK_DNS_OVER_TLS:
+            dot_tcp = [
+                "-s", subnet, "-p", "tcp", "--dport", "853",
+                "-j", "REJECT", "--reject-with", "tcp-reset",
+            ]
+            dot_udp = [
+                "-s", subnet, "-p", "udp", "--dport", "853",
+                "-j", "REJECT", "--reject-with", "icmp-port-unreachable",
+            ]
+            if any((
+                iptables_call("filter", ["-C", FORWARD_CHAIN] + dot_tcp).returncode != 0,
+                iptables_call("filter", ["-C", FORWARD_CHAIN] + dot_udp).returncode != 0,
+            )):
+                return False
+
         mark_rule = ["-s", subnet]
         if not FULL_ROUTE_TO_PROXY:
             mark_rule.extend([
@@ -1355,6 +1997,17 @@ def service_is_active(unit):
         ["systemctl", "is-active", "--quiet", unit],
         timeout=15,
     ).returncode == 0
+
+
+def dns_workers_are_ready(dns_routes):
+    if not dns_routes or not service_is_active("dnsmasq.service"):
+        return False
+    primary_address = dns_primary_address(dns_routes)
+    return all(
+        item["address"] == primary_address
+        or service_is_active(dns_worker_unit(item["address"]))
+        for item in dns_routes
+    )
 
 
 def tun_interfaces_are_ready(lanes):
@@ -1404,10 +2057,10 @@ def ipset_is_ready():
     ).returncode == 0
 
 
-def apply_runtime_routing(vpn_subnets, lanes):
+def apply_runtime_routing(vpn_subnets, dns_routes, lanes):
     for lane in lanes:
         setup_tun2socks_interface(lane)
-    setup_vpn_forwarding(vpn_subnets)
+    setup_vpn_forwarding(vpn_subnets, dns_routes)
     setup_iptables_fwmark(vpn_subnets)
     setup_tun2socks_routing(lanes)
 
@@ -1416,8 +2069,9 @@ def lane_signature(lanes):
     return tuple(sorted((lane["key"], lane["slot"], lane["proxy"]) for lane in lanes))
 
 
-def reconcile_loop(initial_subnets, initial_lanes, initial_route_lanes):
+def reconcile_loop(initial_subnets, initial_dns_routes, initial_lanes, initial_route_lanes):
     known_subnets = initial_subnets
+    known_dns_routes = initial_dns_routes
     configured_lanes = initial_lanes
     route_lanes = initial_route_lanes
     known_signature = lane_signature(configured_lanes)
@@ -1428,9 +2082,12 @@ def reconcile_loop(initial_subnets, initial_lanes, initial_route_lanes):
             if load_managed_float_states():
                 sync_managed_floating_ips_from_database()
             current_subnets = discover_vpn_subnets()
-            if not service_is_active("dnsmasq.service"):
+            current_dns_routes = discover_vpn_dns_routes()
+            dns_changed = current_dns_routes != known_dns_routes
+            if dns_changed or not dns_workers_are_ready(current_dns_routes):
                 setup_ipset()
-                run_cmd("systemctl restart dnsmasq.service", check=True)
+                primary_dns = setup_dnsmasq(current_dns_routes)
+                use_local_dnsmasq(primary_dns)
             refresh_proxy_ipset()
 
             proxy_list_changed = False
@@ -1463,18 +2120,21 @@ def reconcile_loop(initial_subnets, initial_lanes, initial_route_lanes):
                 ipset_is_ready()
                 and tun_interfaces_are_ready(active_lanes)
                 and policy_routing_is_ready(active_lanes)
-                and firewall_rules_present(current_subnets)
+                and dns_workers_are_ready(current_dns_routes)
+                and firewall_rules_present(current_subnets, current_dns_routes)
             )
             if (
                 proxy_list_changed
                 or route_changed
                 or current_subnets != known_subnets
+                or dns_changed
                 or not runtime_ready
             ):
                 setup_ipset()
-                apply_runtime_routing(current_subnets, active_lanes)
+                apply_runtime_routing(current_subnets, current_dns_routes, active_lanes)
                 activate_multi_lane_mode(active_lanes, configured_lanes)
                 known_subnets = current_subnets
+                known_dns_routes = current_dns_routes
                 route_lanes = active_lanes
                 print(
                     f"[+] Runtime routing repaired: "
@@ -1499,15 +2159,16 @@ def main():
     ensure_required_packages()
     setup_install_packages()
     setup_ipset()
-    setup_dnsmasq()
-    use_local_dnsmasq()
+    vpn_subnets = discover_vpn_subnets()
+    dns_routes = discover_vpn_dns_routes()
+    primary_dns = setup_dnsmasq(dns_routes)
+    use_local_dnsmasq(primary_dns)
     refresh_proxy_ipset()
     sync_managed_floating_ips_from_database()
     proxy_records = fetch_proxy_records()
     configured_lanes, started_lanes = prepare_proxy_lanes(proxy_records)
     route_lanes = started_lanes
-    vpn_subnets = discover_vpn_subnets()
-    apply_runtime_routing(vpn_subnets, route_lanes)
+    apply_runtime_routing(vpn_subnets, dns_routes, route_lanes)
     activate_multi_lane_mode(route_lanes, configured_lanes)
 
     if use_dnstt:
@@ -1516,7 +2177,7 @@ def main():
         f"\n[+] Selective multi-proxy routing is active with "
         f"{len(route_lanes)}/{len(configured_lanes)} active lanes."
     )
-    reconcile_loop(vpn_subnets, configured_lanes, route_lanes)
+    reconcile_loop(vpn_subnets, dns_routes, configured_lanes, route_lanes)
 
 
 if __name__ == "__main__":
