@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import glob
+import hashlib
 import ipaddress
 import json
 import os
@@ -21,13 +22,23 @@ from urllib.parse import urlencode, urlsplit
 IPSET_NAME = "proxylist"
 LEGACY_VPN_SUBNET = "10.8.0.0/14"
 PROXY_TABLE = "100"
+# The legacy interface/service is kept until all multi-lane services are ready.
 TUN_DEV = "xd_tun2socks"
 TUN_ADDR = "192.168.255.1/24"
 SOCKS_PROXY = "socks5://127.0.0.1:1080"
+MULTI_TUN_PREFIX = "xd_t2s"
+MULTI_TUN_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+MULTI_UNIT_PREFIX = "xd-tun2socks-"
+MULTI_STATE_DIR = Path("/etc/xd-tun2socks")
+MULTI_PROXY_CACHE_PATH = MULTI_STATE_DIR / "proxies.json"
+MULTI_SLOT_PATH = MULTI_STATE_DIR / "slots.json"
+MULTI_MARKER_PATH = MULTI_STATE_DIR / "multi.enabled"
+MAX_PROXY_LANES = 32
+PROXY_REFRESH_SECONDS = 300
 MARK_CHAIN = "XD_T2S_MARK"
 FORWARD_CHAIN = "XD_T2S_FWD"
 NAT_CHAIN = "XD_T2S_NAT"
-HEALTH_INTERVAL_SECONDS = 60
+RECONCILE_INTERVAL_SECONDS = 60
 PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX"
 FLOAT_IP_API_URL = "https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=XXX"
 TUN2SOCKS_BINARY_URL = "https://aparatvpn.com/tun2socks"
@@ -666,19 +677,53 @@ dns-forward-max=999999
 server=1.0.0.1
 """
 
-    write_text_if_changed("/etc/dnsmasq.conf", dnsmasq_main)
-    write_text_if_changed("/etc/dnsmasq.d/ipset.conf", ipset_config)
-    write_text_if_changed("/etc/dnsmasq.d/openvpn_dns.conf", dns_openvpn)
+    changed = write_text_if_changed("/etc/dnsmasq.conf", dnsmasq_main)
+    changed = write_text_if_changed("/etc/dnsmasq.d/ipset.conf", ipset_config) or changed
+    changed = write_text_if_changed("/etc/dnsmasq.d/openvpn_dns.conf", dns_openvpn) or changed
     run_cmd("dnsmasq --test", check=True)
     run_cmd("systemctl enable dnsmasq", check=True)
-    run_cmd("systemctl restart dnsmasq", check=True)
+    if changed or not service_is_active("dnsmasq.service"):
+        run_cmd("systemctl restart dnsmasq", check=True)
 
 
-# ---------------- tun2socks interface ----------------
-def setup_tun2socks_interface():
-    run_cmd(f"ip link show {TUN_DEV} >/dev/null 2>&1 || ip tuntap add dev {TUN_DEV} mode tun")
-    run_cmd(f"ip addr show dev {TUN_DEV} | grep -q '{TUN_ADDR.split('/')[0]}' || ip addr add {TUN_ADDR} dev {TUN_DEV}")
-    run_cmd(f"ip link set {TUN_DEV} up")
+# ---------------- tun2socks interfaces ----------------
+def lane_device(slot):
+    return f"{MULTI_TUN_PREFIX}{slot:02d}"
+
+
+def lane_address(slot):
+    address = MULTI_TUN_NETWORK.network_address + (slot * 4) + 1
+    return f"{address}/30"
+
+
+def lane_gateway(slot):
+    return lane_address(slot).split("/", 1)[0]
+
+
+def lane_unit(slot):
+    return f"{MULTI_UNIT_PREFIX}{slot:02d}.service"
+
+
+def setup_tun2socks_interface(lane):
+    device = lane["device"]
+    address = lane["address"]
+    run_cmd(
+        f"ip link show {shlex.quote(device)} >/dev/null 2>&1 || "
+        f"ip tuntap add dev {shlex.quote(device)} mode tun",
+        check=True,
+    )
+    run_cmd(
+        f"ip addr replace {shlex.quote(address)} dev {shlex.quote(device)}",
+        check=True,
+    )
+    run_cmd(
+        f"ip link set dev {shlex.quote(device)} mtu 1500 txqueuelen 8192 up",
+        check=True,
+    )
+    run_cmd(
+        f"sysctl -w net.ipv4.conf.{shlex.quote(device)}.rp_filter=0",
+        check=True,
+    )
 
 
 # ---------------- iptables ----------------
@@ -742,16 +787,22 @@ def setup_vpn_forwarding(vpn_subnets):
     ensure_jump("nat", "POSTROUTING", NAT_CHAIN)
 
     for subnet in vpn_subnets:
-        iptables_call("filter", [
-            "-A", FORWARD_CHAIN, "-s", subnet, "-o", TUN_DEV, "-j", "ACCEPT"
-        ], check=True)
-        iptables_call("filter", [
-            "-A", FORWARD_CHAIN, "-d", subnet, "-i", TUN_DEV,
-            "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"
-        ], check=True)
-        iptables_call("nat", [
-            "-A", NAT_CHAIN, "-s", subnet, "-o", TUN_DEV, "-j", "MASQUERADE"
-        ], check=True)
+        # Keep the legacy interface accepted as a rollback path while the
+        # multipath route is switched atomically by `ip route replace`.
+        for output_interface in (f"{MULTI_TUN_PREFIX}+", TUN_DEV):
+            iptables_call("filter", [
+                "-A", FORWARD_CHAIN, "-s", subnet,
+                "-o", output_interface, "-j", "ACCEPT"
+            ], check=True)
+            iptables_call("filter", [
+                "-A", FORWARD_CHAIN, "-d", subnet,
+                "-i", output_interface,
+                "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"
+            ], check=True)
+            iptables_call("nat", [
+                "-A", NAT_CHAIN, "-s", subnet,
+                "-o", output_interface, "-j", "MASQUERADE"
+            ], check=True)
 
 
 def setup_iptables_fwmark(vpn_subnets):
@@ -835,7 +886,10 @@ def setup_iptables_dnstt(DNSTT_PORT):
         )
 
 
-def setup_tun2socks_routing():
+def setup_tun2socks_routing(lanes):
+    if not lanes:
+        raise RuntimeError("refusing to install an empty tun2socks route")
+
     rt_tables_path = Path("/etc/iproute2/rt_tables")
     rt_tables = rt_tables_path.read_text(errors="ignore")
     if not re.search(rf"^\s*{re.escape(PROXY_TABLE)}\s+tun2socks\s*$", rt_tables, re.MULTILINE):
@@ -849,11 +903,24 @@ def setup_tun2socks_routing():
                for line in rules.splitlines()):
         run_cmd("ip rule add priority 100 fwmark 0x1/0x1 table tun2socks", check=True)
 
-    gateway = TUN_ADDR.split("/")[0]
-    run_cmd(
-        f"ip route replace default via {shlex.quote(gateway)} dev {shlex.quote(TUN_DEV)} table tun2socks",
-        check=True,
+    # L4 hashing keeps every TCP connection on one proxy while distributing
+    # different connections across all active lanes.
+    run_cmd("sysctl -w net.ipv4.fib_multipath_hash_policy=1", check=True)
+    command = [
+        "ip", "route", "replace", "default", "table", PROXY_TABLE,
+        "scope", "global",
+    ]
+    for lane in sorted(lanes, key=lambda item: item["slot"]):
+        command.extend([
+            "nexthop", "dev", lane["device"],
+            "weight", str(max(1, int(lane.get("weight", 1)))),
+        ])
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=30,
     )
+    if result.returncode != 0:
+        raise RuntimeError(f"multipath route failed: {result.stderr.strip()}")
+    print(f"[+] Active proxy route lanes: {len(lanes)}")
 
 
 # ---------------- systemd tun2socks ----------------
@@ -885,7 +952,7 @@ def current_service_proxy():
     if not service_path.exists():
         return None
     match = re.search(
-        r"^ExecStart=.*?\s-proxy\s+(\S+)",
+        r"^ExecStart=.*?\s--?proxy\s+(\S+)",
         service_path.read_text(errors="ignore"),
         re.MULTILINE,
     )
@@ -917,28 +984,181 @@ def redact_proxy(proxy_url):
     return re.sub(r"(?<=//)[^/@]+@", "***@", proxy_url)
 
 
-def create_systemd_service():
-    global SOCKS_PROXY
-    # Proxy refresh and floating-IP refresh share one lifecycle entry point.
-    # The database remains authoritative; cached state is only a safe fallback.
-    sync_managed_floating_ips_from_database()
-    SOCKS_PROXY = fetch_proxy_url()
-    systemd_proxy = SOCKS_PROXY.replace("%", "%%")
-    print(f"[+] Using proxy: {redact_proxy(SOCKS_PROXY)}")
+def proxy_record_key(record):
+    digest = hashlib.sha256(record["proxy"].encode("utf-8")).hexdigest()[:12]
+    return f"{record.get('id', 0)}-{digest}"
 
-    service_content = f"""[Unit]
-Description=Tun2Socks Service
+
+def normalize_proxy_records(records):
+    normalized = []
+    seen = set()
+    for position, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        try:
+            proxy_url = clean_proxy_url(str(record.get("proxy", "")))
+        except ValueError:
+            continue
+        if proxy_url in seen:
+            continue
+        seen.add(proxy_url)
+        try:
+            record_id = int(record.get("id", position + 1))
+        except (TypeError, ValueError):
+            record_id = position + 1
+        country = re.sub(r"[^a-z]", "", str(record.get("country", "")).lower())[:2]
+        item = {"id": record_id, "country": country, "proxy": proxy_url}
+        item["key"] = proxy_record_key(item)
+        normalized.append(item)
+    return normalized
+
+
+def load_cached_proxy_records():
+    try:
+        payload = json.loads(MULTI_PROXY_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    records = payload.get("proxies", []) if isinstance(payload, dict) else []
+    return normalize_proxy_records(records)
+
+
+def fetch_proxy_records():
+    separator = "&" if "?" in PROXY_API_URL else "?"
+    url = PROXY_API_URL + separator + "format=json"
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "XD-route-ads/3"})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 200:
+                raise RuntimeError(f"proxy API returned HTTP {response.status}")
+            raw_payload = response.read(1024 * 1024).decode("utf-8", errors="replace")
+        payload = json.loads(raw_payload)
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise RuntimeError("proxy API returned an unsuccessful payload")
+        records = normalize_proxy_records(payload.get("proxies", []))
+        if not records:
+            raise RuntimeError("proxy API returned no valid proxies")
+        MULTI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(MULTI_STATE_DIR, 0o700)
+        cache_payload = json.dumps(
+            {"version": 1, "proxies": records}, sort_keys=True, separators=(",", ":")
+        ) + "\n"
+        write_text_if_changed(MULTI_PROXY_CACHE_PATH, cache_payload, mode=0o600)
+        return records
+    except Exception as exc:
+        cached = load_cached_proxy_records()
+        if cached:
+            print(f"[!] Proxy-list fetch failed; preserving {len(cached)} cached lanes: {exc}")
+            return cached
+        legacy = fetch_proxy_url()
+        records = normalize_proxy_records([{"id": 0, "country": "", "proxy": legacy}])
+        print(f"[!] Multi-proxy API unavailable; using the legacy proxy: {exc}")
+        return records
+
+
+def proxy_lane_limit(proxy_count):
+    override_raw = os.environ.get("XD_TUN2SOCKS_MAX_LANES", "").strip()
+    if override_raw:
+        try:
+            override = int(override_raw)
+        except ValueError:
+            override = 0
+        if override > 0:
+            return min(proxy_count, MAX_PROXY_LANES, override)
+    return min(proxy_count, MAX_PROXY_LANES)
+
+
+def select_proxy_records(records):
+    limit = proxy_lane_limit(len(records))
+    return records[:limit]
+
+
+def load_slot_map():
+    try:
+        payload = json.loads(MULTI_SLOT_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result = {}
+    used = set()
+    for key, raw_slot in payload.items():
+        try:
+            slot = int(raw_slot)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= slot < MAX_PROXY_LANES and slot not in used:
+            result[str(key)] = slot
+            used.add(slot)
+    return result
+
+
+def assign_lane_slots(records):
+    previous = load_slot_map()
+    active_keys = {record["key"] for record in records}
+    mapping = {key: slot for key, slot in previous.items() if key in active_keys}
+    used = set(mapping.values())
+    for record in records:
+        if record["key"] in mapping:
+            continue
+        for slot in range(MAX_PROXY_LANES):
+            if slot not in used:
+                mapping[record["key"]] = slot
+                used.add(slot)
+                break
+        else:
+            raise RuntimeError("no free tun2socks lane slot")
+
+    MULTI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(MULTI_STATE_DIR, 0o700)
+    write_text_if_changed(
+        MULTI_SLOT_PATH,
+        json.dumps(mapping, sort_keys=True, separators=(",", ":")) + "\n",
+        mode=0o600,
+    )
+    return mapping
+
+
+def build_lanes(records):
+    selected = select_proxy_records(records)
+    mapping = assign_lane_slots(selected)
+    lanes = []
+    for record in selected:
+        slot = mapping[record["key"]]
+        lane = dict(record)
+        lane.update({
+            "slot": slot,
+            "device": lane_device(slot),
+            "address": lane_address(slot),
+            "gateway": lane_gateway(slot),
+            "unit": lane_unit(slot),
+            "weight": 1,
+        })
+        lanes.append(lane)
+    return sorted(lanes, key=lambda item: item["slot"])
+
+
+def lane_gomaxprocs(lane_count):
+    cpus = max(1, os.cpu_count() or 1)
+    return max(1, min(4, cpus // max(1, lane_count)))
+
+
+def lane_service_content(lane, lane_count):
+    systemd_proxy = lane["proxy"].replace("%", "%%")
+    label = lane["country"] or "proxy"
+    return f"""[Unit]
+Description=XD tun2socks lane {lane['slot']:02d} ({label})
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=/bin/bash -c 'ip link show {TUN_DEV} >/dev/null 2>&1 || ip tuntap add dev {TUN_DEV} mode tun'
-ExecStartPre=/bin/bash -c 'ip addr show dev {TUN_DEV} | grep -q "{TUN_ADDR.split("/")[0]}" || ip addr add {TUN_ADDR} dev {TUN_DEV}'
-ExecStartPre=/sbin/ip link set {TUN_DEV} up
-ExecStart=/opt/tun2socks -device {TUN_DEV} -proxy {systemd_proxy} -loglevel error
+Environment=GOMAXPROCS={lane_gomaxprocs(lane_count)}
+ExecStartPre=/bin/bash -c 'ip link show {lane['device']} >/dev/null 2>&1 || ip tuntap add dev {lane['device']} mode tun'
+ExecStartPre=/sbin/ip addr replace {lane['address']} dev {lane['device']}
+ExecStartPre=/sbin/ip link set dev {lane['device']} mtu 1500 txqueuelen 8192 up
+ExecStart=/opt/tun2socks --device {lane['device']} --proxy {systemd_proxy} --loglevel error
 Restart=always
-RestartSec=3
+RestartSec=2
 LimitNOFILE=1048576
 TasksMax=infinity
 TimeoutStopSec=5s
@@ -948,13 +1168,72 @@ SendSIGKILL=yes
 [Install]
 WantedBy=multi-user.target
 """
-    changed = write_text_if_changed(
-        "/etc/systemd/system/tun2socks.service", service_content, mode=0o600
-    )
-    if changed:
+
+
+def prepare_proxy_lanes(records):
+    lanes = build_lanes(records)
+    changed_units = set()
+    for lane in lanes:
+        setup_tun2socks_interface(lane)
+        unit_path = Path("/etc/systemd/system") / lane["unit"]
+        if write_text_if_changed(
+            unit_path, lane_service_content(lane, len(lanes)), mode=0o600
+        ):
+            changed_units.add(lane["unit"])
+
+    if changed_units:
         run_cmd("systemctl daemon-reload", check=True)
-    run_cmd("systemctl enable tun2socks.service", check=True)
-    run_cmd("systemctl restart tun2socks.service", check=True)
+    for lane in lanes:
+        run_cmd(f"systemctl enable {shlex.quote(lane['unit'])}", check=True)
+        action = "restart" if lane["unit"] in changed_units else "start"
+        run_cmd(f"systemctl {action} {shlex.quote(lane['unit'])}", check=True)
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if all(service_is_active(lane["unit"]) for lane in lanes):
+            break
+        time.sleep(1)
+    active = [lane for lane in lanes if service_is_active(lane["unit"])]
+    if not active:
+        raise RuntimeError("none of the tun2socks lanes started")
+    if len(active) != len(lanes):
+        print(f"[!] Only {len(active)}/{len(lanes)} tun2socks lanes started")
+    return lanes, active
+
+
+def cleanup_stale_lanes(active_slots):
+    active_slots = {int(slot) for slot in active_slots}
+    for unit_path in Path("/etc/systemd/system").glob(f"{MULTI_UNIT_PREFIX}*.service"):
+        match = re.fullmatch(rf"{re.escape(MULTI_UNIT_PREFIX)}(\d+)\.service", unit_path.name)
+        if not match:
+            continue
+        slot = int(match.group(1))
+        if slot in active_slots:
+            continue
+        run_cmd(f"systemctl disable --now {shlex.quote(unit_path.name)}")
+        try:
+            unit_path.unlink()
+        except OSError:
+            pass
+        run_cmd(f"ip link delete {shlex.quote(lane_device(slot))} 2>/dev/null || true")
+
+
+def activate_multi_lane_mode(route_lanes, configured_lanes=None):
+    configured_lanes = configured_lanes or route_lanes
+    setup_tun2socks_routing(route_lanes)
+    write_text_if_changed(
+        MULTI_MARKER_PATH,
+        json.dumps({
+            "enabled": True,
+            "configured_lanes": len(configured_lanes),
+            "route_lanes": len(route_lanes),
+        }, sort_keys=True) + "\n",
+        mode=0o600,
+    )
+    run_cmd("systemctl disable --now tun2socks.service 2>/dev/null || true")
+    run_cmd("systemctl reset-failed tun2socks.service 2>/dev/null || true")
+    run_cmd(f"ip link delete {shlex.quote(TUN_DEV)} 2>/dev/null || true")
+    cleanup_stale_lanes({lane["slot"] for lane in configured_lanes})
 
 
 def prepare_dnsmasq_install():
@@ -994,18 +1273,21 @@ def firewall_rules_present(vpn_subnets):
             "-m", "set", "--match-set", IPSET_NAME, "dst",
             "-j", "MARK", "--set-xmark", "0x1/0x1",
         ])
-        forward_out = ["-s", subnet, "-o", TUN_DEV, "-j", "ACCEPT"]
-        forward_back = [
-            "-d", subnet, "-i", TUN_DEV,
-            "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT",
-        ]
-        masquerade = ["-s", subnet, "-o", TUN_DEV, "-j", "MASQUERADE"]
-        checks = (
-            ("mangle", MARK_CHAIN, mark_rule),
-            ("filter", FORWARD_CHAIN, forward_out),
-            ("filter", FORWARD_CHAIN, forward_back),
-            ("nat", NAT_CHAIN, masquerade),
-        )
+        checks = [("mangle", MARK_CHAIN, mark_rule)]
+        for output_interface in (f"{MULTI_TUN_PREFIX}+", TUN_DEV):
+            checks.extend([
+                ("filter", FORWARD_CHAIN, [
+                    "-s", subnet, "-o", output_interface, "-j", "ACCEPT",
+                ]),
+                ("filter", FORWARD_CHAIN, [
+                    "-d", subnet, "-i", output_interface,
+                    "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
+                    "-j", "ACCEPT",
+                ]),
+                ("nat", NAT_CHAIN, [
+                    "-s", subnet, "-o", output_interface, "-j", "MASQUERADE",
+                ]),
+            ])
         if any(
             iptables_call(table, ["-C", chain] + rule).returncode != 0
             for table, chain, rule in checks
@@ -1028,17 +1310,20 @@ def service_is_active(unit):
     ).returncode == 0
 
 
-def tun_interface_is_ready():
-    result = subprocess.run(
-        ["ip", "-o", "-4", "addr", "show", "dev", TUN_DEV],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    return result.returncode == 0 and TUN_ADDR.split("/")[0] in result.stdout
+def tun_interfaces_are_ready(lanes):
+    for lane in lanes:
+        result = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show", "dev", lane["device"]],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0 or lane["gateway"] not in result.stdout:
+            return False
+    return bool(lanes)
 
 
-def policy_routing_is_ready():
+def policy_routing_is_ready(lanes):
     rules = subprocess.run(
         ["ip", "rule", "show"],
         capture_output=True,
@@ -1056,15 +1341,9 @@ def policy_routing_is_ready():
         and ("lookup tun2socks" in line or f"lookup {PROXY_TABLE}" in line)
         for line in rules.stdout.splitlines()
     )
-    expected_gateway = TUN_ADDR.split("/")[0]
-    route_present = (
-        routes.returncode == 0
-        and any(
-            line.startswith("default ")
-            and f"via {expected_gateway}" in line
-            and f"dev {TUN_DEV}" in line
-            for line in routes.stdout.splitlines()
-        )
+    route_present = routes.returncode == 0 and all(
+        f"dev {lane['device']}" in routes.stdout
+        for lane in lanes
     )
     return rule_present and route_present
 
@@ -1078,17 +1357,26 @@ def ipset_is_ready():
     ).returncode == 0
 
 
-def apply_runtime_routing(vpn_subnets):
-    setup_tun2socks_interface()
-    setup_tun2socks_routing()
+def apply_runtime_routing(vpn_subnets, lanes):
+    for lane in lanes:
+        setup_tun2socks_interface(lane)
     setup_vpn_forwarding(vpn_subnets)
     setup_iptables_fwmark(vpn_subnets)
+    setup_tun2socks_routing(lanes)
 
 
-def health_loop(initial_subnets):
+def lane_signature(lanes):
+    return tuple(sorted((lane["key"], lane["slot"], lane["proxy"]) for lane in lanes))
+
+
+def reconcile_loop(initial_subnets, initial_lanes, initial_route_lanes):
     known_subnets = initial_subnets
+    configured_lanes = initial_lanes
+    route_lanes = initial_route_lanes
+    known_signature = lane_signature(configured_lanes)
+    last_proxy_refresh = time.monotonic()
     while True:
-        time.sleep(HEALTH_INTERVAL_SECONDS)
+        time.sleep(RECONCILE_INTERVAL_SECONDS)
         try:
             if load_managed_float_states():
                 sync_managed_floating_ips_from_database()
@@ -1096,21 +1384,61 @@ def health_loop(initial_subnets):
             if not service_is_active("dnsmasq.service"):
                 setup_ipset()
                 run_cmd("systemctl restart dnsmasq.service", check=True)
-            if not service_is_active("tun2socks.service"):
-                run_cmd("systemctl restart tun2socks.service", check=True)
+
+            proxy_list_changed = False
+            if time.monotonic() - last_proxy_refresh >= PROXY_REFRESH_SECONDS:
+                records = fetch_proxy_records()
+                refreshed_lanes, _started_lanes = prepare_proxy_lanes(records)
+                refreshed_signature = lane_signature(refreshed_lanes)
+                proxy_list_changed = refreshed_signature != known_signature
+                configured_lanes = refreshed_lanes
+                known_signature = refreshed_signature
+                last_proxy_refresh = time.monotonic()
+                if proxy_list_changed:
+                    print(f"[+] Proxy lane configuration changed: {len(configured_lanes)} lanes")
+
+            for lane in configured_lanes:
+                if not service_is_active(lane["unit"]):
+                    run_cmd(f"systemctl restart {shlex.quote(lane['unit'])}")
+
+            active_lanes = [
+                lane for lane in configured_lanes if service_is_active(lane["unit"])
+            ]
+            if not active_lanes:
+                print("[!] No tun2socks service is active; preserving the previous route")
+                continue
+
+            route_changed = {
+                lane["key"] for lane in active_lanes
+            } != {lane["key"] for lane in route_lanes}
             runtime_ready = (
                 ipset_is_ready()
-                and tun_interface_is_ready()
-                and policy_routing_is_ready()
+                and tun_interfaces_are_ready(active_lanes)
+                and policy_routing_is_ready(active_lanes)
                 and firewall_rules_present(current_subnets)
             )
-            if current_subnets != known_subnets or not runtime_ready:
+            if (
+                proxy_list_changed
+                or route_changed
+                or current_subnets != known_subnets
+                or not runtime_ready
+            ):
                 setup_ipset()
-                apply_runtime_routing(current_subnets)
+                apply_runtime_routing(current_subnets, active_lanes)
+                activate_multi_lane_mode(active_lanes, configured_lanes)
                 known_subnets = current_subnets
-                print("[+] Runtime routing rules repaired.")
+                route_lanes = active_lanes
+                print(
+                    f"[+] Runtime routing repaired: "
+                    f"{len(route_lanes)}/{len(configured_lanes)} active lanes"
+                )
+            else:
+                print(
+                    f"[+] Proxy routing: {len(active_lanes)}/{len(configured_lanes)} "
+                    f"active lanes"
+                )
         except Exception as exc:
-            print(f"[!] Health check failed: {exc}")
+            print(f"[!] Routing reconciliation failed: {exc}")
 
 
 # ---------------- main ----------------
@@ -1125,15 +1453,21 @@ def main():
     setup_ipset()
     setup_dnsmasq()
     use_local_dnsmasq()
-    setup_tun2socks_interface()
-    create_systemd_service()
+    sync_managed_floating_ips_from_database()
+    proxy_records = fetch_proxy_records()
+    configured_lanes, started_lanes = prepare_proxy_lanes(proxy_records)
+    route_lanes = started_lanes
     vpn_subnets = discover_vpn_subnets()
-    apply_runtime_routing(vpn_subnets)
+    apply_runtime_routing(vpn_subnets, route_lanes)
+    activate_multi_lane_mode(route_lanes, configured_lanes)
 
     if use_dnstt:
         setup_iptables_dnstt(5300)
-    print("\n[+] Selective tun2socks routing is active for every OpenVPN subnet.")
-    health_loop(vpn_subnets)
+    print(
+        f"\n[+] Selective multi-proxy routing is active with "
+        f"{len(route_lanes)}/{len(configured_lanes)} active lanes."
+    )
+    reconcile_loop(vpn_subnets, configured_lanes, route_lanes)
 
 
 if __name__ == "__main__":
