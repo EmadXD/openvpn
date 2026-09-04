@@ -83,6 +83,7 @@ DOMAINS = [
     "app-measurement.com",
     "apps.admob.com",
     "clients.google.com",
+    "csp.withgoogle.com",
     "dartsearch.net",
     "developers.google.com",
     "doubleclick-cn.net",
