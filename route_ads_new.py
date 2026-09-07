@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import glob
 import hashlib
 import ipaddress
 import json
@@ -20,7 +19,7 @@ from urllib.parse import urlencode, urlsplit
 
 # ---------------- تنظیمات ----------------
 IPSET_NAME = "proxylist"
-LEGACY_VPN_SUBNET = "10.8.0.0/14"
+LEGACY_VPN_SUBNET = "10.8.0.0/16"
 PROXY_TABLE = "100"
 # The legacy interface/service is kept until all multi-lane services are ready.
 TUN_DEV = "xd_tun2socks"
@@ -993,8 +992,13 @@ def setup_install_packages():
 
 def discover_vpn_networks():
     networks = set()
-    config_paths = set(glob.glob("/etc/openvpn/server*.conf"))
-    config_paths.update(glob.glob("/etc/openvpn/server/*.conf"))
+    config_paths = [
+        path for path in (
+            "/etc/openvpn/server.conf",
+            "/etc/openvpn/server/server.conf",
+        )
+        if Path(path).is_file()
+    ]
 
     for config_path in sorted(config_paths):
         try:
@@ -1009,6 +1013,7 @@ def discover_vpn_networks():
         except OSError as exc:
             print(f"[!] Could not read {config_path}: {exc}")
 
+    active_tun_networks = []
     try:
         output = subprocess.run(
             ["ip", "-o", "-4", "addr", "show"],
@@ -1020,9 +1025,14 @@ def discover_vpn_networks():
         for line in output.splitlines():
             match = re.search(r"\d+:\s+(tun\d+)\s+.*?\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)", line)
             if match:
-                networks.add(ipaddress.ip_interface(match.group(2)).network)
+                active_tun_networks.append((int(match.group(1)[3:]), ipaddress.ip_interface(match.group(2)).network))
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         print(f"[!] Could not inspect active OpenVPN interfaces: {exc}")
+
+    # A single-instance installation owns only the primary TUN. This fallback
+    # is used when a distro stores the server config outside the usual paths.
+    if not networks and active_tun_networks:
+        networks.add(min(active_tun_networks, key=lambda item: item[0])[1])
 
     networks = {network for network in networks
                 if isinstance(network, ipaddress.IPv4Network)}
@@ -1035,9 +1045,8 @@ def discover_vpn_networks():
 def discover_vpn_subnets():
     networks = discover_vpn_networks()
 
-    # Collapse only exactly adjacent/overlapping networks. On a multi-instance
-    # host this turns 10.8/16..10.23/16 into two exact /13 rules instead of
-    # making every packet walk sixteen equivalent iptables rules.
+    # Keep this generic for a non-default primary subnet while intentionally
+    # ignoring obsolete generated OpenVPN instances.
     result = sorted(
         ipaddress.collapse_addresses(networks),
         key=lambda item: (int(item.network_address), item.prefixlen),
