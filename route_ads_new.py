@@ -1193,6 +1193,8 @@ pid-file=/run/{DNS_WORKER_PREFIX}{token}.pid
 no-resolv
 server=1.1.1.1
 server=1.0.0.1
+server=8.8.8.8
+server=8.8.4.4
 cache-size={DNS_CACHE_SIZE}
 dns-forward-max={DNS_FORWARD_MAX}
 conf-file=/etc/dnsmasq.d/ipset.conf
@@ -1255,6 +1257,8 @@ dns-forward-max={DNS_FORWARD_MAX}
     )
     dns_openvpn = """server=1.1.1.1
 server=1.0.0.1
+server=8.8.8.8
+server=8.8.4.4
 """
 
     changed = write_text_if_changed("/etc/dnsmasq.conf", dnsmasq_main)
@@ -1909,7 +1913,7 @@ def prepare_dnsmasq_install():
     except OSError:
         pass
     write_text_if_changed(
-        "/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 1.0.0.1\n"
+        "/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 1.0.0.1\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n"
     )
 
 
