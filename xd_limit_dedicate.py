@@ -4,13 +4,15 @@
 The script is safe to run under PM2: it applies the complete profile at start,
 then refreshes only live process and network settings. It never changes routes,
 IP addresses, firewall rules, OpenVPN configuration, or stunnel configuration.
-Use --once for a manual apply-and-exit run.
+Use --once for a manual apply-and-exit run. Shared kernel ceilings are
+persisted with the same raise-only policy as the Nginx installer.
 
 Measured in audit.json on 2026-09-10: 314376/4194304 conntrack entries
 and 503.37 GiB host RAM. The proposed conntrack ceiling uses at most 1/16
 of effective RAM, estimating 1 KiB per flow plus hash resize overlap. This
 is a planning allowance, not measured per-flow memory or certified capacity.
-Other capacity ceilings, including the 8388608 NOFILE cap, are unchanged.
+Shared Nginx ceilings are unified; the per-process NOFILE cap and
+the conntrack RAM budget remain unchanged.
 """
 
 import argparse
@@ -25,6 +27,97 @@ import time
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+
+
+"""Shared ceiling policy embedded in both standalone tuners and Nginx installer."""
+
+SHARED_CAPACITY_V1 = True
+SHARED_CAPACITY_FLOORS = {
+    'fs.file-max': 67108864,
+    'fs.nr_open': 8388608,
+    'net.core.somaxconn': 262144,
+    'net.core.netdev_max_backlog': 1000000,
+    'net.ipv4.tcp_max_syn_backlog': 262144,
+    'net.ipv4.tcp_max_tw_buckets': 4000000,
+}
+
+
+def apply_shared_capacity(run_command=None, config_path=None, lock_path=None):
+    """Only raise ceilings, verify writes, and persist the same values for boot.
+
+    Neither writer owns TCP timeouts here. They remain in the RAM-aware tuner.
+    The legacy filename is retained so an old Nginx boot file cannot override us.
+    """
+    import fcntl
+    import os
+    from pathlib import Path
+    import subprocess
+    import tempfile
+
+    if run_command is None:
+        def run_command(args):
+            return subprocess.run(args, capture_output=True, text=True, timeout=30)
+    destination = Path(config_path or '/etc/sysctl.d/99-nginx-high-capacity.conf')
+    lockfile = Path(lock_path or '/run/xd-shared-capacity.lock')
+    errors, actual = [], {}
+    with lockfile.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        previous = destination.read_text() if destination.exists() else ''
+        retained = []
+        legacy_timeouts = {
+            'net.ipv4.tcp_fin_timeout', 'net.ipv4.tcp_tw_reuse', 'net.ipv4.tcp_syncookies',
+            'net.ipv4.tcp_keepalive_time', 'net.ipv4.tcp_keepalive_intvl',
+            'net.ipv4.tcp_keepalive_probes',
+        }
+        persisted = {}
+        for line in previous.splitlines():
+            key, sep, value = line.partition('=')
+            key = key.strip()
+            if key in SHARED_CAPACITY_FLOORS and sep:
+                try:
+                    persisted[key] = max(persisted.get(key, 0), int(value.split('#')[0].strip()))
+                except ValueError:
+                    errors.append(key + ': invalid persisted capacity')
+            elif key not in legacy_timeouts and line.strip() and not line.lstrip().startswith('#'):
+                retained.append(line)
+        if errors:
+            return 0, errors
+        for key, floor in SHARED_CAPACITY_FLOORS.items():
+            try:
+                before = run_command(['sysctl', '-n', key])
+                if before.returncode:
+                    raise ValueError('read failed')
+                current = int(before.stdout.strip())
+                desired = max(current, floor, persisted.get(key, 0))
+                if current < desired:
+                    written = run_command(['sysctl', '-q', '-w', key + '=' + str(desired)])
+                    if written.returncode:
+                        raise ValueError('write failed: ' + written.stderr.strip())
+                after = run_command(['sysctl', '-n', key])
+                if after.returncode or int(after.stdout.strip()) < desired:
+                    raise ValueError('readback below requested capacity')
+                actual[key] = int(after.stdout.strip())
+            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                errors.append(key + ': ' + str(exc))
+        # Never persist a partially verified policy, or lower a ceiling on rollback.
+        if not errors:
+            content = '# Shared XD capacity V1; Nginx and xd_limit use the same floors.\n'
+            content += ''.join(key + ' = ' + str(value) + '\n' for key, value in actual.items())
+            content += ''.join(line + '\n' for line in retained)
+            if content != previous:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                fd, temporary = tempfile.mkstemp(prefix='.xd-shared-', dir=str(destination.parent))
+                try:
+                    with os.fdopen(fd, 'w') as stream:
+                        stream.write(content)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.chmod(temporary, 0o644)
+                    os.replace(temporary, destination)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+    return len(actual), errors
 
 
 GIB = 1024 ** 3
@@ -271,8 +364,8 @@ def build_capacity_profile(memory_bytes: int) -> CapacityProfile:
         memory_bytes=memory_bytes,
         memory_gib=memory_gib,
         scale=memory_gib / float(BASELINE_MEMORY_GIB),
-        system_file_max=system_file_max,
-        kernel_nr_open=process_nofile,
+        system_file_max=max(system_file_max, SHARED_CAPACITY_FLOORS['fs.file-max']),
+        kernel_nr_open=max(process_nofile, SHARED_CAPACITY_FLOORS['fs.nr_open']),
         process_nofile=process_nofile,
         process_nproc=process_nproc,
         service_tasks_max=service_tasks_max,
@@ -280,10 +373,10 @@ def build_capacity_profile(memory_bytes: int) -> CapacityProfile:
         vm_max_map_count=vm_max_map_count,
         conntrack_max=conntrack_max,
         conntrack_hashsize=hashsize,
-        netdev_backlog=netdev_backlog,
+        netdev_backlog=max(netdev_backlog, SHARED_CAPACITY_FLOORS['net.core.netdev_max_backlog']),
         netdev_budget=netdev_budget,
-        syn_backlog=syn_backlog,
-        tw_buckets=tw_buckets,
+        syn_backlog=max(syn_backlog, SHARED_CAPACITY_FLOORS['net.ipv4.tcp_max_syn_backlog']),
+        tw_buckets=max(tw_buckets, SHARED_CAPACITY_FLOORS['net.ipv4.tcp_max_tw_buckets']),
         tcp_max_orphans=tcp_max_orphans,
         socket_buffer_max=socket_buffer_max,
     )
@@ -338,7 +431,7 @@ SYSCTLS: Dict[str, str] = {
     "kernel.threads-max": str(PROFILE.kernel_threads_max),
     "vm.max_map_count": str(PROFILE.vm_max_map_count),
     "net.core.default_qdisc": "fq",
-    "net.core.somaxconn": "65535",
+    "net.core.somaxconn": "262144",
     "net.core.netdev_budget": str(PROFILE.netdev_budget),
     "net.core.netdev_budget_usecs": "8000",
     "net.core.netdev_max_backlog": str(PROFILE.netdev_backlog),
@@ -516,7 +609,12 @@ def apply_conntrack_capacity() -> Tuple[bool, str]:
 def apply_sysctls() -> Tuple[int, List[str]]:
     success = 0
     errors: List[str] = []
+    shared_ok, shared_errors = apply_shared_capacity(run)
+    success += shared_ok
+    errors.extend(shared_errors)
     for key, value in SYSCTLS.items():
+        if key in SHARED_CAPACITY_FLOORS:
+            continue
         result = run(["sysctl", "-q", "-w", f"{key}={value}"])
         if result.returncode == 0:
             success += 1
@@ -586,6 +684,8 @@ def configured_units(running_units: Iterable[str]) -> List[str]:
 def service_task_limit(unit: str) -> str:
     # Keep the dedicated installer's per-worker cgroups unbounded. RAM-aware
     # kernel/FD limits remain finite; this does not reserve memory or spawn tasks.
+    if unit == 'nginx.service':
+        return 'infinity'
     if unit.startswith(('xd-stunnel-pool@', 'openvpn@', 'openvpn-server@')):
         return 'infinity'
     return str(SERVICE_TASKS_MAX)
@@ -598,8 +698,8 @@ def write_runtime_service_drop_in(unit: str) -> None:
     temporary = drop_in_dir / ".40-xd-runtime-limits.conf.tmp"
     content = (
         "[Service]\n"
-        f"LimitNOFILE={PROCESS_NOFILE}\n"
-        f"LimitNPROC={PROCESS_NPROC}\n"
+        f"LimitNOFILE={max(PROCESS_NOFILE, 2097152) if unit == 'nginx.service' else PROCESS_NOFILE}\n"
+        f"LimitNPROC={'infinity' if unit == 'nginx.service' else PROCESS_NPROC}\n"
         f"TasksMax={service_task_limit(unit)}\n"
     )
     temporary.write_text(content, encoding="ascii")
@@ -851,6 +951,17 @@ def apply_process_limits() -> Tuple[int, List[str]]:
     success = 0
     errors: List[str] = []
     for pid in process_pids(PROCESS_NAMES):
+        try:
+            if Path(f"/proc/{pid}/comm").read_text().strip() == "nginx":
+                soft, hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)
+                requested = max(PROCESS_NOFILE, 2097152, soft)
+                resource.prlimit(pid, resource.RLIMIT_NOFILE, (requested, max(hard, requested)))
+                resource.prlimit(pid, resource.RLIMIT_NPROC, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+                success += 1
+                continue
+        except (OSError, ValueError) as exc:
+            errors.append(f"pid {pid}: {exc}")
+            continue
         result = run(
             [
                 "prlimit",
