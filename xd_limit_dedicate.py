@@ -5,6 +5,12 @@ The script is safe to run under PM2: it applies the complete profile at start,
 then refreshes only live process and network settings. It never changes routes,
 IP addresses, firewall rules, OpenVPN configuration, or stunnel configuration.
 Use --once for a manual apply-and-exit run.
+
+Measured in audit.json on 2026-09-10: 314376/4194304 conntrack entries
+and 503.37 GiB host RAM. The proposed conntrack ceiling uses at most 1/16
+of effective RAM, estimating 1 KiB per flow plus hash resize overlap. This
+is a planning allowance, not measured per-flow memory or certified capacity.
+Other capacity ceilings, including the 8388608 NOFILE cap, are unchanged.
 """
 
 import argparse
@@ -17,13 +23,26 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, Iterable, List, NamedTuple, Sequence, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 
 GIB = 1024 ** 3
 BASELINE_MEMORY_GIB = 2
 DEDICATED_MULTI_COMPATIBLE = True
+DEDICATED_CONNTRACK_RAM_V2 = True
+CONNTRACK_RAM_DIVISOR = 16
+CONNTRACK_FLOW_BYTES = 1024
+CONNTRACK_BUCKET_BYTES = 16
+CONNTRACK_ENTRY_QUANTUM = 1024
+# Conservative signed-int envelope for Linux sysctl/module interfaces.
+CONNTRACK_NATIVE_MAX = (1 << 31) - 1
+# nf_ct_alloc_hashtable checks UINT_MAX / sizeof(hlist_nulls_head).
+# Use the 64-bit head size (8 bytes), also conservative on 32-bit systems.
+CONNTRACK_HASH_NATIVE_MAX = ((1 << 32) - 1) // 8
+CONNTRACK_HASH_PATH = Path("/sys/module/nf_conntrack/parameters/hashsize")
+CONNTRACK_MAX_KEY = "net.netfilter.nf_conntrack_max"
+CONNTRACK_COUNT_KEY = "net.netfilter.nf_conntrack_count"
 
 
 class CapacityProfile(NamedTuple):
@@ -48,13 +67,90 @@ class CapacityProfile(NamedTuple):
     socket_buffer_max: int
 
 
+def cgroup_memory_limit_paths() -> List[Path]:
+    """Locate our v1/v2 memory controller and every visible ancestor limit."""
+    paths = {Path("/sys/fs/cgroup/memory.max"),
+             Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")}
+    try:
+        membership = Path("/proc/self/cgroup").read_text(encoding="ascii")
+        mounts = Path("/proc/self/mountinfo").read_text(encoding="ascii")
+    except FileNotFoundError:
+        return sorted(paths)
+
+    groups = {}
+    for line in membership.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            raise ValueError("Malformed /proc/self/cgroup")
+        for controller in parts[1].split(","):
+            if controller in ("", "memory"):
+                group = PurePosixPath(parts[2])
+                if not group.is_absolute() or ".." in group.parts:
+                    raise ValueError("Invalid cgroup membership path")
+                groups[controller] = group
+
+    mounted, mapped = set(), set()
+    for line in mounts.splitlines():
+        before, separator, after = line.partition(" - ")
+        fields, filesystem = before.split(), after.split()
+        if not separator or len(fields) < 6 or len(filesystem) < 3:
+            raise ValueError("Malformed /proc/self/mountinfo")
+        if filesystem[0] == "cgroup2":
+            controller, filename = "", "memory.max"
+        elif filesystem[0] == "cgroup" and "memory" in filesystem[2].split(","):
+            controller, filename = "memory", "memory.limit_in_bytes"
+        else:
+            continue
+        if controller not in groups:
+            continue
+        mounted.add(controller)
+        def unescape(value):
+            return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
+        root = PurePosixPath(unescape(fields[3]))
+        mount = Path(unescape(fields[4]))
+        if not root.is_absolute() or not mount.is_absolute() or ".." in root.parts + mount.parts:
+            raise ValueError("Invalid cgroup mount path")
+        group = groups[controller]
+        try:
+            relative = group.relative_to(root)
+        except ValueError:
+            if group != PurePosixPath("/"):
+                continue
+            # A cgroup namespace may expose its own root as '/' in membership.
+            relative = PurePosixPath(".")
+        mapped.add(controller)
+        current = mount / relative
+        while True:
+            paths.add(current / filename)
+            if current == mount:
+                break
+            current = current.parent
+    if mounted - mapped:
+        raise ValueError("Cannot resolve current cgroup memory hierarchy; refusing to guess")
+    return sorted(paths)
+
+
+def parse_memory_limit(raw: str, label: str) -> Optional[int]:
+    value = raw.strip()
+    if value == "max":
+        return None
+    if not re.fullmatch(r"[0-9]{1,20}", value) or int(value) <= 0:
+        raise ValueError(f"Invalid memory ceiling at {label}; refusing to guess")
+    number = int(value)
+    if number > (1 << 63) - 1:
+        raise ValueError(f"Memory ceiling out of range at {label}")
+    # v1 represents an unlimited ceiling with a page-aligned LONG_MAX.
+    return None if number >= 1 << 60 else number
+
+
 def detect_total_memory_bytes() -> int:
-    """Return usable host/VM memory without requiring an external package."""
+    """Return host RAM clamped by finite cgroup limits, never MemAvailable."""
     candidates: List[int] = []
     try:
         for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
-            if line.startswith("MemTotal:"):
-                candidates.append(int(line.split()[1]) * 1024)
+            match = re.fullmatch(r"MemTotal:\s+([0-9]+) kB", line.strip())
+            if match and int(match[1]) > 0:
+                candidates.append(int(match[1]) * 1024)
                 break
     except (OSError, ValueError, IndexError):
         pass
@@ -67,26 +163,55 @@ def detect_total_memory_bytes() -> int:
     except (OSError, ValueError):
         pass
 
-    # Respect a finite cgroup limit when the script runs inside a container.
-    for path in (
-        Path("/sys/fs/cgroup/memory.max"),
-        Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-    ):
+    if not candidates:
+        candidates.append(4 * GIB)
+    for path in cgroup_memory_limit_paths():
         try:
             raw = path.read_text(encoding="ascii").strip()
-            value = int(raw)
-            if 256 * 1024 ** 2 <= value < 1 << 60:
-                candidates.append(value)
-        except (OSError, ValueError):
-            pass
+        except FileNotFoundError:
+            continue
+        value = parse_memory_limit(raw, str(path))
+        if value is not None:
+            candidates.append(value)
 
-    return min(candidates) if candidates else 4 * GIB
+    return min(candidates)
 
 
 def lower_power_of_two(value: int) -> int:
     if value < 1:
         return 1
     return 1 << (value.bit_length() - 1)
+
+
+def conntrack_hashsize(entries: int) -> int:
+    buckets = max(1024, (entries + 3) // 4)
+    return 1 << (buckets - 1).bit_length()
+
+
+def conntrack_memory_cost(entries: int, buckets: int, old_buckets: int = 0) -> int:
+    # Reserve two tables for resize; an existing larger table must also fit.
+    return (entries * CONNTRACK_FLOW_BYTES +
+            (buckets + max(buckets, old_buckets)) * CONNTRACK_BUCKET_BYTES)
+
+
+def build_conntrack_capacity(memory_bytes: int) -> Tuple[int, int]:
+    if type(memory_bytes) is not int or memory_bytes <= 0:
+        raise ValueError("Effective RAM must be a positive integer byte count")
+    budget = memory_bytes // CONNTRACK_RAM_DIVISOR
+    low = 0
+    high = min(CONNTRACK_NATIVE_MAX, budget // CONNTRACK_FLOW_BYTES) // CONNTRACK_ENTRY_QUANTUM
+    while low < high:
+        middle = (low + high + 1) // 2
+        entries = middle * CONNTRACK_ENTRY_QUANTUM
+        buckets = conntrack_hashsize(entries)
+        if buckets <= CONNTRACK_HASH_NATIVE_MAX and conntrack_memory_cost(entries, buckets) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    if not low:
+        raise ValueError("Effective RAM is too small for the conntrack budget")
+    entries = low * CONNTRACK_ENTRY_QUANTUM
+    return entries, conntrack_hashsize(entries)
 
 
 def scale_from_baseline(
@@ -104,6 +229,7 @@ def scale_from_baseline(
 
 
 def build_capacity_profile(memory_bytes: int) -> CapacityProfile:
+    conntrack_max, hashsize = build_conntrack_capacity(memory_bytes)
     # VPS providers advertise rounded GiB values while Linux reports slightly
     # less, so use nearest-GiB sizing rather than truncating a 4 GiB VPS to 3.
     memory_gib = max(1, int((memory_bytes + GIB // 2) // GIB))
@@ -129,8 +255,6 @@ def build_capacity_profile(memory_bytes: int) -> CapacityProfile:
     service_tasks_max = scale_from_baseline(16_384, memory_gib, 131_072)
     kernel_threads_max = scale_from_baseline(131_072, memory_gib, 1_048_576)
     vm_max_map_count = scale_from_baseline(262_144, memory_gib, 1_048_576)
-    conntrack_raw = scale_from_baseline(262_144, memory_gib, 4_194_304)
-    conntrack_max = conntrack_raw
     netdev_backlog = scale_from_baseline(65_536, memory_gib, 500_000)
     netdev_budget = scale_from_baseline(600, memory_gib, 2_400)
     syn_backlog = scale_from_baseline(8_192, memory_gib, 131_072)
@@ -155,7 +279,7 @@ def build_capacity_profile(memory_bytes: int) -> CapacityProfile:
         kernel_threads_max=kernel_threads_max,
         vm_max_map_count=vm_max_map_count,
         conntrack_max=conntrack_max,
-        conntrack_hashsize=lower_power_of_two(conntrack_max // 4),
+        conntrack_hashsize=hashsize,
         netdev_backlog=netdev_backlog,
         netdev_budget=netdev_budget,
         syn_backlog=syn_backlog,
@@ -236,7 +360,6 @@ SYSCTLS: Dict[str, str] = {
     "net.ipv4.tcp_syncookies": "1",
     "net.ipv4.tcp_tw_reuse": "1",
     "net.ipv4.tcp_wmem": f"4096 65536 {PROFILE.socket_buffer_max}",
-    "net.netfilter.nf_conntrack_max": str(CONNTRACK_MAX),
     "net.netfilter.nf_conntrack_tcp_timeout_close_wait": "60",
     "net.netfilter.nf_conntrack_tcp_timeout_established": "7200",
     "net.netfilter.nf_conntrack_tcp_timeout_fin_wait": "60",
@@ -285,19 +408,109 @@ def load_conntrack() -> Tuple[bool, str]:
     return True, "loaded"
 
 
-def set_conntrack_hashsize() -> Tuple[bool, str]:
-    path = Path("/sys/module/nf_conntrack/parameters/hashsize")
-    if not path.exists():
-        return False, f"{path} does not exist"
-    desired = str(CONNTRACK_HASHSIZE)
+def native_conntrack_value(raw: str, label: str, minimum: int = 1,
+                           maximum: int = CONNTRACK_NATIVE_MAX) -> int:
+    if not re.fullmatch(r"[0-9]{1,10}", raw.strip()):
+        raise ValueError(f"Invalid {label} readback")
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{label} outside native integer bounds")
+    return value
+
+
+def read_conntrack_value(key: str, minimum: int = 1) -> int:
+    result = run(["sysctl", "-n", key])
+    if result.returncode:
+        raise ValueError(f"Cannot read {key}: {result.stderr.strip() or result.returncode}")
+    return native_conntrack_value(result.stdout, key, minimum)
+
+
+def read_conntrack_hashsize() -> int:
+    return native_conntrack_value(CONNTRACK_HASH_PATH.read_text(encoding="ascii"),
+                                  "hashsize", maximum=CONNTRACK_HASH_NATIVE_MAX)
+
+
+def check_conntrack_occupancy() -> int:
+    count = read_conntrack_value(CONNTRACK_COUNT_KEY, 0)
+    if count > CONNTRACK_MAX:
+        raise ValueError(f"Resize deferred: measured count {count} exceeds proposed {CONNTRACK_MAX}")
+    return count
+
+
+def set_conntrack_hashsize(expected_before: Optional[int] = None) -> Tuple[bool, str]:
     try:
-        before = path.read_text(encoding="ascii").strip()
-        if before != desired:
-            path.write_text(desired, encoding="ascii")
-        after = path.read_text(encoding="ascii").strip()
-    except OSError as exc:
+        native_conntrack_value(str(CONNTRACK_HASHSIZE), "proposed hashsize",
+                              maximum=CONNTRACK_HASH_NATIVE_MAX)
+        before = read_conntrack_hashsize()
+        if expected_before is not None and before != expected_before:
+            raise ValueError("Hashsize changed concurrently; resize deferred")
+        if before != CONNTRACK_HASHSIZE:
+            if before > CONNTRACK_HASHSIZE:
+                check_conntrack_occupancy()
+            if conntrack_memory_cost(CONNTRACK_MAX, CONNTRACK_HASHSIZE, before) > PROFILE.memory_bytes // CONNTRACK_RAM_DIVISOR:
+                raise ValueError("Existing hash resize overlap exceeds RAM budget; resize deferred")
+            CONNTRACK_HASH_PATH.write_text(str(CONNTRACK_HASHSIZE), encoding="ascii")
+        after = read_conntrack_hashsize()
+    except (OSError, ValueError) as exc:
         return False, str(exc)
-    return after == desired, f"{before} -> {after}"
+    return after == CONNTRACK_HASHSIZE, f"hashsize {before} -> {after}, proposed={CONNTRACK_HASHSIZE}"
+
+
+def set_conntrack_max(expected_before: int) -> None:
+    before = read_conntrack_value(CONNTRACK_MAX_KEY)
+    if before != expected_before:
+        raise ValueError("Conntrack maximum changed concurrently; resize deferred")
+    if before != CONNTRACK_MAX:
+        if before > CONNTRACK_MAX:
+            check_conntrack_occupancy()
+        result = run(["sysctl", "-q", "-w", f"{CONNTRACK_MAX_KEY}={CONNTRACK_MAX}"])
+        if result.returncode:
+            raise ValueError(f"Conntrack maximum write failed: {result.stderr.strip() or result.returncode}")
+    after = read_conntrack_value(CONNTRACK_MAX_KEY)
+    if after != CONNTRACK_MAX:
+        raise ValueError(f"Conntrack maximum readback {after} != proposed {CONNTRACK_MAX}")
+
+
+def apply_conntrack_capacity() -> Tuple[bool, str]:
+    """Grow the hash before admission; lower admission before shrinking the hash.
+
+    Refuse unsafe downward changes without flushing established flows. These
+    read/verify guards detect races but cannot atomically freeze live traffic.
+    A partial failure keeps the successfully verified stage and reports failure;
+    no blind rollback may shrink a table now needed by newly admitted flows.
+    """
+    try:
+        native_conntrack_value(str(CONNTRACK_MAX), "proposed conntrack maximum")
+        native_conntrack_value(str(CONNTRACK_HASHSIZE), "proposed hashsize",
+                              maximum=CONNTRACK_HASH_NATIVE_MAX)
+        if CONNTRACK_HASHSIZE != conntrack_hashsize(CONNTRACK_MAX):
+            raise ValueError("Proposed hashsize does not match conntrack capacity")
+        count = check_conntrack_occupancy()
+        before = read_conntrack_value(CONNTRACK_MAX_KEY)
+        old_hash = read_conntrack_hashsize()
+        cost = conntrack_memory_cost(CONNTRACK_MAX, CONNTRACK_HASHSIZE, old_hash)
+        if cost > PROFILE.memory_bytes // CONNTRACK_RAM_DIVISOR:
+            raise ValueError("Proposed flows plus existing hash resize overlap exceed RAM budget")
+        log(f"conntrack measured={count}/{before} hashsize={old_hash}; "
+            f"proposed={CONNTRACK_MAX} hashsize={CONNTRACK_HASHSIZE} "
+            f"estimated_peak_bytes={cost} budget_bytes={PROFILE.memory_bytes // CONNTRACK_RAM_DIVISOR}")
+        if before > CONNTRACK_MAX:
+            set_conntrack_max(before)
+        hash_ok, detail = set_conntrack_hashsize(expected_before=old_hash)
+        if not hash_ok:
+            raise ValueError(f"Conntrack hash verification failed: {detail}")
+        if before <= CONNTRACK_MAX:
+            set_conntrack_max(before)
+        actual_max = read_conntrack_value(CONNTRACK_MAX_KEY)
+        actual_hash = read_conntrack_hashsize()
+        readback = (f"desired_max={CONNTRACK_MAX} effective_max={actual_max} "
+                    f"desired_hashsize={CONNTRACK_HASHSIZE} effective_hashsize={actual_hash}")
+        if actual_max != CONNTRACK_MAX or actual_hash != CONNTRACK_HASHSIZE:
+            raise ValueError(f"Conntrack final readback differs: {readback}")
+        count = check_conntrack_occupancy()
+        return True, f"{readback} measured_count={count}"
+    except (OSError, ValueError) as exc:
+        return False, str(exc)
 
 
 def apply_sysctls() -> Tuple[int, List[str]]:
@@ -696,7 +909,10 @@ def apply_limits() -> int:
     log("loading nf_conntrack")
     conntrack_loaded, conntrack_detail = load_conntrack()
 
-    hash_ok, hash_detail = set_conntrack_hashsize()
+    if conntrack_loaded:
+        conntrack_ok, conntrack_detail = apply_conntrack_capacity()
+    else:
+        conntrack_ok = False
     sysctl_ok, sysctl_errors = apply_sysctls()
     service_ok, service_errors = apply_runtime_task_limits()
     process_ok, process_errors = apply_process_limits()
@@ -712,14 +928,14 @@ def apply_limits() -> int:
         + network_errors
         + own_errors
     )
-    if not conntrack_loaded:
+    if not conntrack_ok:
         errors.insert(0, f"nf_conntrack: {conntrack_detail}")
     log(
         "applied "
         f"sysctl={sysctl_ok}/{len(SYSCTLS)} "
         f"services={service_ok} processes={process_ok} cpu={cpu_ok} "
         f"network={network_ok} "
-        f"hashsize={'ok' if hash_ok else 'warning'} ({hash_detail})"
+        f"conntrack={'ok' if conntrack_ok else 'warning'} ({conntrack_detail})"
     )
     log(
         "runtime "
