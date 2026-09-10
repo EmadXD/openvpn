@@ -509,6 +509,304 @@ block_udp = True
 
 
 # ---------------- Helpers ----------------
+
+import grp
+from urllib.parse import unquote
+ORDINARY_PROXY_BROKER_V1 = True
+ORDINARY_PROXY_BROKER_PORTS_V2 = True
+BROKER_TOPOLOGY_PATH = MULTI_STATE_DIR / "broker-topology.json"
+BROKER_TOPOLOGY_VERSION = 1
+BROKER_CONFIG = Path("/etc/xd-proxy-broker/config.json")
+BROKER_BINARY = "/usr/local/bin/xd-proxy-broker"
+
+def setup_proxy_guard():
+    # Keep classified traffic off the physical WAN even while marks/routes reconcile.
+    chain = "XD_PROXY_GUARD"
+    iptables_call("filter", ["-N", chain])
+    lines = ["*filter", f"-F {chain}",
+             f"-A {chain} -o {MULTI_TUN_PREFIX}+ -j RETURN",
+             f"-A {chain} -o {TUN_DEV} -j RETURN"]
+    for protocol, reject in (("tcp", "tcp-reset"), ("udp", "icmp-port-unreachable")):
+        ports = "" if FULL_ROUTE_TO_PROXY else " -m multiport --dports 80,443,8080,8443"
+        lines.append(f"-A {chain} -p {protocol}{ports} -m set --match-set {IPSET_NAME} dst "
+                     f"-j REJECT --reject-with {reject}")
+    rule = ["-i", "tun+", "-j", chain]
+    if iptables_call("filter", ["-C", "FORWARD"] + rule).returncode == 0:
+        lines.append(f"-D FORWARD -i tun+ -j {chain}")
+    lines.extend([f"-I FORWARD 1 -i tun+ -j {chain}", "COMMIT", ""])
+    result = subprocess.run(["iptables-restore", "--noflush", "-w", "10"],
+                            input="\n".join(lines), text=True, capture_output=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError("Proxy fail-closed guard failed: " + result.stderr[-500:])
+
+def broker_topology_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate topology field")
+        result[key] = value
+    return result
+
+def read_broker_topology_json(path):
+    import stat
+    try:
+        metadata = path.lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & 0o077
+                or metadata.st_uid not in (0, os.geteuid())
+                or metadata.st_size > 8 * 1024 * 1024):
+            raise ValueError("unsafe topology file")
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=broker_topology_object)
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeError("Invalid or unreadable proxy topology state; refusing physical lane changes") from exc
+
+def load_broker_topology():
+    try:
+        topology = read_broker_topology_json(BROKER_TOPOLOGY_PATH)
+    except FileNotFoundError:
+        return None
+    valid = (isinstance(topology, dict) and set(topology) == {"version", "lanes"}
+             and type(topology["version"]) is int and topology["version"] == BROKER_TOPOLOGY_VERSION
+             and isinstance(topology["lanes"], list) and 0 < len(topology["lanes"]) <= MAX_PROXY_LANES)
+    if not valid:
+        raise RuntimeError("Invalid proxy topology schema; refusing physical lane changes")
+    slots = set()
+    for lane in topology["lanes"]:
+        if (not isinstance(lane, dict) or set(lane) != {"slot", "primary", "profile", "gomaxprocs"}
+                or type(lane["slot"]) is not int or not 0 <= lane["slot"] < MAX_PROXY_LANES
+                or lane["slot"] in slots
+                or not isinstance(lane["primary"], str) or not 0 < len(lane["primary"]) <= 256
+                or not isinstance(lane["profile"], str) or not 0 < len(lane["profile"]) <= 256
+                or type(lane["gomaxprocs"]) is not int or lane["gomaxprocs"] < 1):
+            raise RuntimeError("Invalid proxy topology lane; refusing physical lane changes")
+        slots.add(lane["slot"])
+    return topology
+
+def initial_broker_topology(records):
+    # Never let the legacy forgiving reader silently discard a physical slot.
+    try:
+        raw = read_broker_topology_json(MULTI_SLOT_PATH)
+    except FileNotFoundError:
+        raw = {}
+    if (not isinstance(raw, dict)
+            or any(not key or type(slot) is not int or not 0 <= slot < MAX_PROXY_LANES
+                   for key, slot in raw.items())
+            or len(set(raw.values())) != len(raw)):
+        raise RuntimeError("Invalid legacy proxy slot map; refusing topology migration")
+    mapping = load_slot_map() if raw else {}
+    if mapping != raw:
+        raise RuntimeError("Proxy slot map changed during topology migration")
+    if not mapping:
+        mapping = {record["key"]: slot for slot, record in enumerate(select_proxy_records(records))}
+    if not mapping:
+        raise RuntimeError("No proxy lanes available; physical topology unchanged")
+    by_key = {record["key"]: record for record in records}
+    gomaxprocs = lane_gomaxprocs(len(mapping))
+    return {"version": BROKER_TOPOLOGY_VERSION, "lanes": [
+        {"slot": slot, "primary": key, "profile": by_key.get(key, {}).get("profile") or "default",
+         "gomaxprocs": gomaxprocs}
+        for key, slot in sorted(mapping.items(), key=lambda item: item[1])
+    ]}
+
+def broker_config(records, lanes, memory_bytes=None):
+    memory_bytes = memory_bytes or os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            limit = int(Path(path).read_text().strip())
+            if limit > 0:
+                memory_bytes = min(memory_bytes, limit)
+        except (OSError, ValueError):
+            pass
+    upstreams, identities, aliases = [], {}, {}
+    for record in records:
+        profile = record.get('profile') or 'default'
+        if not isinstance(profile, str) or len(profile) > 256:
+            raise RuntimeError('Invalid proxy profile; previous broker configuration retained')
+        parsed = urlsplit(record['proxy'])
+        host = parsed.hostname
+        address = ('[' + host + ']' if ':' in host else host) + ':' + str(parsed.port)
+        identity = (parsed.scheme, address.lower(), unquote(parsed.username or ''), unquote(parsed.password or ''))
+        if identity in identities and identities[identity][1] != profile:
+            raise RuntimeError('Duplicate proxy identity has conflicting profiles; previous broker configuration retained')
+        if identity not in identities:
+            identities[identity] = (record['key'], profile)
+            upstreams.append(dict(key=record['key'], type=identity[0], address=address,
+                                  username=identity[2], password=identity[3], profile=profile))
+        aliases[record['key']] = identities[identity][0]
+    try:
+        nofile = min(8388608, int(Path('/proc/sys/fs/nr_open').read_text()))
+    except (OSError, ValueError):
+        nofile = 1048576
+    fd_slots = max(128, (nofile - len(lanes) - 1024) // 2)
+    max_connections = max(128, min(fd_slots, memory_bytes // 8 // (192 * 1024)))
+    max_pending = min(max_connections, max(32, memory_bytes // 64 // (64 * 1024)))
+    return dict(upstreams=upstreams,
+                lanes=[dict(slot=lane['slot'], primary=aliases[lane['key']],
+                            listen='127.0.0.1:' + str(broker_port_base() + lane['slot'])) for lane in lanes],
+                total_timeout='4s', attempt_timeout='1500ms', handshake_timeout='5s',
+                cooldown='15s', half_close_timeout='30s', max_candidates=3,
+                max_connections=max_connections, max_pending=max_pending)
+
+def prepare_proxy_broker(records, lanes):
+    if not Path(BROKER_BINARY).is_file():
+        raise RuntimeError('Proxy broker binary has not been installed')
+    ensure_broker_ports(lanes)
+    if subprocess.run(['id', '-u', 'xd-proxy'], capture_output=True).returncode:
+        run_cmd('useradd --system --no-create-home --shell /usr/sbin/nologin xd-proxy', check=True)
+    group = grp.getgrnam('xd-proxy').gr_gid
+    BROKER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(BROKER_CONFIG.parent, 0o750)
+    os.chown(BROKER_CONFIG.parent, 0, group)
+    payload = json.dumps(broker_config(records, lanes), sort_keys=True, separators=(',', ':')) + '\n'
+    temporary = BROKER_CONFIG.with_suffix('.next')
+    temporary.write_text(payload)
+    temporary.chmod(0o640)
+    os.chown(temporary, 0, group)
+    checked = subprocess.run([BROKER_BINARY, '-config', str(temporary), '-check'],
+                             capture_output=True, text=True, timeout=15)
+    if checked.returncode:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError('Proxy broker rejected new configuration; previous configuration retained')
+    previous = BROKER_CONFIG.read_bytes() if BROKER_CONFIG.exists() else None
+    if previous == payload.encode():
+        temporary.unlink()
+    else:
+        os.replace(temporary, BROKER_CONFIG)
+    nofile = min(8388608, int(Path('/proc/sys/fs/nr_open').read_text()))
+    unit = '''[Unit]
+Description=XD proxy connection failover
+Wants=network-online.target systemd-sysctl.service
+After=network-online.target systemd-sysctl.service
+
+[Service]
+Type=simple
+User=xd-proxy
+Group=xd-proxy
+ExecStart=/usr/local/bin/xd-proxy-broker -config /etc/xd-proxy-broker/config.json -admin 127.0.0.1:{broker_admin} -reload-interval 5s
+Restart=always
+RestartSec=1
+TimeoutStopSec=35
+LimitNOFILE={broker_nofile}
+TasksMax=infinity
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target
+'''.replace('{broker_nofile}', str(nofile)).replace('{broker_admin}', str(broker_port_base() - 1))
+    if write_text_if_changed('/etc/systemd/system/xd-proxy-broker.service', unit, mode=0o644):
+        run_cmd('systemctl daemon-reload', check=True)
+    run_cmd('systemctl enable --now xd-proxy-broker.service', check=True)
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    for attempt in range(15):
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:' + str(broker_port_base() - 1) + '/ready', timeout=1) as response:
+                status = json.load(response)
+            if status.get('ready') and status.get('config_sha256') == digest:
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(1)
+    if previous is not None:
+        temporary.write_bytes(previous)
+        temporary.chmod(0o640)
+        os.chown(temporary, 0, group)
+        os.replace(temporary, BROKER_CONFIG)
+    raise RuntimeError('Proxy broker readiness failed; tun2socks configuration left unchanged')
+
+def broker_port_base():
+    path = MULTI_STATE_DIR / 'broker-ports.json'
+    try:
+        state = read_broker_topology_json(path)
+    except FileNotFoundError:
+        return 20000
+    if (not isinstance(state, dict) or set(state) != {'base'}
+            or type(state['base']) is not int or not 20000 <= state['base'] <= 64000):
+        raise RuntimeError('Invalid proxy listener allocation')
+    return state['base']
+
+def ensure_broker_ports(lanes):
+    import socket
+    path = MULTI_STATE_DIR / 'broker-ports.json'
+    if path.exists():
+        base = broker_port_base()
+        reserve_broker_ports([base - 1] + [base + lane['slot'] for lane in lanes])
+        return
+    if BROKER_CONFIG.exists():
+        previous = json.loads(BROKER_CONFIG.read_text())
+        bases = {int(lane['listen'].rsplit(':', 1)[1]) - lane['slot'] for lane in previous['lanes']}
+        if bases != {20000}:
+            raise RuntimeError('Unknown previous proxy port allocation')
+        reserve_broker_ports([19999] + [20000 + lane['slot'] for lane in lanes])
+        write_text_if_changed(path, '{"base":20000}\n', mode=0o600)
+        return
+    # Hold every socket while reserving its port. Existing VPN sockets are never closed.
+    for base in range(20000, 64001, 64):
+        held = []
+        try:
+            for port in [base - 1] + [base + lane['slot'] for lane in lanes]:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                held.append(sock)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(('127.0.0.1', port))
+                sock.listen(1)
+            reserve_broker_ports([base - 1] + [base + lane['slot'] for lane in lanes])
+            write_text_if_changed(path, json.dumps({'base': base}) + '\n', mode=0o600)
+            return
+        except OSError:
+            continue
+        finally:
+            for sock in held:
+                sock.close()
+    raise RuntimeError('No unoccupied loopback listener block is available')
+
+def reserve_broker_ports(ports):
+    import fcntl
+    with open('/run/xd-proxy-ports.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = Path('/proc/sys/net/ipv4/ip_local_reserved_ports')
+        values = set()
+        for field in path.read_text().strip().split(','):
+            if not field:
+                continue
+            ends = field.split('-')
+            values.update(range(int(ends[0]), int(ends[-1]) + 1))
+        values.update(ports)
+        ranges = []
+        for port in sorted(values):
+            if ranges and port == ranges[-1][1] + 1:
+                ranges[-1][1] = port
+            else:
+                ranges.append([port, port])
+        value = ','.join(str(a) if a == b else str(a) + '-' + str(b) for a, b in ranges)
+        write_text_if_changed('/etc/sysctl.d/98-xd-proxy-ports.conf',
+                              'net.ipv4.ip_local_reserved_ports = ' + value + '\n', mode=0o644)
+        if path.read_text().strip() != value:
+            path.write_text(value + '\n')
+
+def resume_existing_proxy_routing():
+    if not MULTI_MARKER_PATH.is_file() or not BROKER_TOPOLOGY_PATH.is_file():
+        return False
+    subnets = discover_vpn_subnets()
+    dns_routes = discover_vpn_dns_routes()
+    records = fetch_proxy_records()
+    lanes = build_lanes(records)
+    if not (ipset_is_ready() and dns_workers_are_ready(dns_routes)
+            and tun_interfaces_are_ready(lanes) and policy_routing_is_ready(lanes)
+            and firewall_rules_present(subnets, dns_routes)
+            and all(service_is_active(lane['unit']) for lane in lanes)):
+        return False
+    configured, active = prepare_proxy_lanes(records)
+    setup_proxy_guard()
+    print('[+] Existing proxy routing adopted without restarting DNS or VPN services', flush=True)
+    reconcile_loop(subnets, dns_routes, configured, active)
+    return True
+
 def run_cmd(cmd, check=False, timeout=300):
     print(f"[+] Running: {cmd}")
     try:
@@ -1817,22 +2115,53 @@ def assign_lane_slots(records):
 
 
 def build_lanes(records):
-    selected = select_proxy_records(records)
-    mapping = assign_lane_slots(selected)
+    topology = load_broker_topology()
+    by_key = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise RuntimeError("Invalid proxy record; physical topology unchanged")
+        key, profile = record.get("key"), record.get("profile") or "default"
+        if (not isinstance(key, str) or not 0 < len(key) <= 256 or key in by_key
+                or not isinstance(profile, str) or not 0 < len(profile) <= 256
+                or not isinstance(record.get("proxy"), str) or not record["proxy"]):
+            raise RuntimeError("Invalid proxy key, profile or URL; physical topology unchanged")
+        clean_proxy_url(record["proxy"])
+        by_key[key] = dict(record, profile=profile)
+    if not by_key:
+        raise RuntimeError("No proxy records available; physical topology unchanged")
+    if topology is None:
+        topology = initial_broker_topology(list(by_key.values()))
+
+    # Keep every surviving assignment before distributing only missing primaries.
+    counts = {key: 0 for key in by_key}
+    for lane in topology["lanes"]:
+        primary = by_key.get(lane["primary"])
+        if primary is not None and primary["profile"] == lane["profile"]:
+            counts[lane["primary"]] += 1
+    for lane in sorted(topology["lanes"], key=lambda item: item["slot"]):
+        primary = by_key.get(lane["primary"])
+        if primary is not None and primary["profile"] == lane["profile"]:
+            continue
+        eligible = [key for key, record in by_key.items() if record["profile"] == lane["profile"]]
+        if not eligible:
+            raise RuntimeError("No compatible proxy for a physical lane; previous topology retained")
+        lane["primary"] = min(eligible, key=lambda key: (counts[key], key))
+        counts[lane["primary"]] += 1
+
+    # All validation/assignment finishes before the first filesystem change.
+    MULTI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(MULTI_STATE_DIR, 0o700)
+    write_text_if_changed(BROKER_TOPOLOGY_PATH,
+                          json.dumps(topology, sort_keys=True, separators=(",", ":")) + "\n", mode=0o600)
     lanes = []
-    for record in selected:
-        slot = mapping[record["key"]]
-        lane = dict(record)
-        lane.update({
-            "slot": slot,
-            "device": lane_device(slot),
-            "address": lane_address(slot),
-            "gateway": lane_gateway(slot),
-            "unit": lane_unit(slot),
-            "weight": 1,
-        })
+    for physical in sorted(topology["lanes"], key=lambda item: item["slot"]):
+        slot = physical["slot"]
+        lane = dict(by_key[physical["primary"]])
+        lane.update(slot=slot, device=lane_device(slot), address=lane_address(slot),
+                    gateway=lane_gateway(slot), unit=lane_unit(slot), weight=1,
+                    gomaxprocs=physical["gomaxprocs"])
         lanes.append(lane)
-    return sorted(lanes, key=lambda item: item["slot"])
+    return lanes
 
 
 def lane_gomaxprocs(lane_count):
@@ -1841,16 +2170,19 @@ def lane_gomaxprocs(lane_count):
 
 
 def lane_service_content(lane, lane_count):
-    systemd_proxy = lane["proxy"].replace("%", "%%")
-    label = lane["country"] or "proxy"
+    systemd_proxy = 'socks5://127.0.0.1:' + str(broker_port_base() + lane['slot'])
+    gomaxprocs = lane.get("gomaxprocs")
+    if gomaxprocs is None:
+        gomaxprocs = lane_gomaxprocs(lane_count)
     return f"""[Unit]
-Description=XD tun2socks lane {lane['slot']:02d} ({label})
+Description=XD tun2socks lane {lane['slot']:02d}
 Wants=network-online.target
-After=network-online.target
+After=network-online.target xd-proxy-broker.service
+Wants=xd-proxy-broker.service
 
 [Service]
 Type=simple
-Environment=GOMAXPROCS={lane_gomaxprocs(lane_count)}
+Environment=GOMAXPROCS={gomaxprocs}
 ExecStartPre=/bin/bash -c 'ip link show {lane['device']} >/dev/null 2>&1 || ip tuntap add dev {lane['device']} mode tun'
 ExecStartPre=/sbin/ip addr replace {lane['address']} dev {lane['device']}
 ExecStartPre=/sbin/ip link set dev {lane['device']} mtu 1500 txqueuelen 8192 up
@@ -1870,6 +2202,7 @@ WantedBy=multi-user.target
 
 def prepare_proxy_lanes(records):
     lanes = build_lanes(records)
+    prepare_proxy_broker(records, lanes)
     changed_units = set()
     for lane in lanes:
         setup_tun2socks_interface(lane)
@@ -2120,6 +2453,7 @@ def apply_runtime_routing(vpn_subnets, dns_routes, lanes):
     setup_vpn_forwarding(vpn_subnets, dns_routes)
     setup_iptables_fwmark(vpn_subnets)
     setup_tun2socks_routing(lanes)
+    setup_proxy_guard()
 
 
 def lane_signature(lanes):
@@ -2145,6 +2479,7 @@ def reconcile_loop(initial_subnets, initial_dns_routes, initial_lanes, initial_r
                 setup_ipset()
                 primary_dns = setup_dnsmasq(current_dns_routes)
                 use_local_dnsmasq(primary_dns)
+            setup_proxy_guard()
             refresh_proxy_ipset()
 
             proxy_list_changed = False
@@ -2211,6 +2546,9 @@ def main():
     if os.geteuid() != 0:
         print("[!] لطفاً با sudo اجرا کنید.")
         sys.exit(1)
+
+    if '--resume-existing' in sys.argv and resume_existing_proxy_routing():
+        return
 
     prepare_dnsmasq_install()
     ensure_required_packages()
