@@ -7,6 +7,31 @@ import requests
 
 import time
 
+# XD_PM2_NUMERIC_GUARD_V1
+def restart_capacity_pm2():
+    """Resolve by script identity, but always invoke PM2 with a numeric ID."""
+    import json
+    import os
+    import subprocess
+    try:
+        apps = json.loads(subprocess.check_output(['pm2', 'jlist'], text=True, timeout=20))
+        matches = [a for a in apps if a.get('pm2_env', {}).get('pm_exec_path') in
+                   ('/root/openvpn/xd_limit_new.py', '/root/openvpn/xd_limit_dedicate.py')]
+        if len(matches) != 1:
+            print('Capacity restart skipped: expected exactly one capacity process', flush=True)
+            return False
+        number = matches[0]['pm_id']
+        if type(number) is not int or number < 0:
+            return False
+        if os.environ.get('XD_PM2_GUARD_DRY_RUN') == '1':
+            print('Verified capacity PM2 ID: ' + str(number), flush=True)
+            return True
+        return subprocess.run(['pm2', 'restart', str(number)], timeout=45).returncode == 0
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print('Capacity restart skipped: ' + type(exc).__name__, flush=True)
+        return False
+
+
 domains = [
     "https://aparatvpn.com",
     "https://us.xdvpn.com",
@@ -143,7 +168,7 @@ if __name__ == "__main__":
                     time.sleep(sec_wait_restart)
                     create_systemd_service()
                     time.sleep(5)
-                    os.system("sudo pm2 restart 4")
+                    restart_capacity_pm2()
             else:
                 time.sleep(sec_wait_random)
 
