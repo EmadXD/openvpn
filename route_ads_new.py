@@ -1,1024 +1,2247 @@
 #!/usr/bin/env python3
-"""Apply RAM-aware runtime capacity tuning for OpenVPN/stunnel servers.
-
-The script is safe to run under PM2: it applies the complete profile at start,
-then refreshes only live process and network settings. It never changes routes,
-IP addresses, firewall rules, OpenVPN configuration, or stunnel configuration.
-Use --once for a manual apply-and-exit run.
-
-Measured in audit.json on 2026-09-10: 314376/4194304 conntrack entries
-and 503.37 GiB host RAM. The proposed conntrack ceiling uses at most 1/16
-of effective RAM, estimating 1 KiB per flow plus hash resize overlap. This
-is a planning allowance, not measured per-flow memory or certified capacity.
-Other capacity ceilings, including the 8388608 NOFILE cap, are unchanged.
-"""
-
-import argparse
+import hashlib
+import ipaddress
+import json
 import os
+import platform
 import re
-import resource
+import shlex
 import shutil
-import signal
 import subprocess
 import sys
+import tempfile
 import time
-from datetime import datetime
-from pathlib import Path, PurePosixPath
-from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+import urllib.error
+import urllib.request
+import zipfile
+from pathlib import Path
+from urllib.parse import urlencode, urlsplit
+
+# ---------------- تنظیمات ----------------
+IPSET_NAME = "proxylist"
+LEGACY_VPN_SUBNET = "10.8.0.0/16"
+PROXY_TABLE = "100"
+# The legacy interface/service is kept until all multi-lane services are ready.
+TUN_DEV = "xd_tun2socks"
+TUN_ADDR = "192.168.255.1/24"
+SOCKS_PROXY = "socks5://127.0.0.1:1080"
+MULTI_TUN_PREFIX = "xd_t2s"
+MULTI_TUN_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+MULTI_UNIT_PREFIX = "xd-tun2socks-"
+MULTI_STATE_DIR = Path("/etc/xd-tun2socks")
+MULTI_PROXY_CACHE_PATH = MULTI_STATE_DIR / "proxies.json"
+MULTI_SLOT_PATH = MULTI_STATE_DIR / "slots.json"
+MULTI_MARKER_PATH = MULTI_STATE_DIR / "multi.enabled"
+MAX_PROXY_LANES = 32
+PROXY_REFRESH_SECONDS = 300
+MARK_CHAIN = "XD_T2S_MARK"
+FORWARD_CHAIN = "XD_T2S_FWD"
+NAT_CHAIN = "XD_T2S_NAT"
+DNS_NAT_CHAIN = "XD_T2S_DNS"
+DNS_INPUT_CHAIN = "XD_T2S_DNS_IN"
+DNS_REDIRECT_ADDRESS = "10.8.0.1"
+DNS_WORKER_PREFIX = "xd-dnsmasq-"
+DNS_WORKER_CONFIG_DIR = Path("/etc/xd-dnsmasq")
+DNS_CACHE_SIZE = 10000
+DNS_FORWARD_MAX = 4096
+ENFORCE_VPN_DNS = True
+BLOCK_DNS_OVER_TLS = True
+RECONCILE_INTERVAL_SECONDS = 300
+PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX"
+FLOAT_IP_API_URL = "https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=XXX"
+TUN2SOCKS_BINARY_URL = "https://aparatvpn.com/tun2socks"
+FLOAT_STATE_DIR = Path("/etc/xd-dedicated-float")
+FLOAT_SERVICE_PREFIX = "xd-dedicated-float-"
+FLOAT_SYNC_SCRIPT_PATH = Path("/usr/local/sbin/xd-dedicated-float-sync")
+FLOAT_UNIT_DIR = Path("/etc/systemd/system")
+MAX_FLOAT_IPS = 65536
+use_dnstt = False
+
+DOMAINS = [
+    "1e100.net",
+    "1e100.com",
+    "1e100.org",
+    "2mdn-cn.net",
+    "2mdn.net",
+    "ad.doubleclick.net",
+    "adclick.g.doubleclick.net",
+    "admob-gmats.uc.r.appspot.com",
+    "admob-api.google.com",
+    "admob-cn.com",
+    "admob.com",
+    "admob.google.com",
+    "admob.googleapis.com",
+    "adtrafficquality.google",
+    "adservice.google.com",
+    "adservice.google.com.ae",
+    "adservices.google.com",
+    "adsense.com",
+    "adsensecustomsearchads.com",
+    "analytics.google.com",
+    "app-measurement-cn.com",
+    "app-measurement.com",
+    "apps.admob.com",
+    "clients.google.com",
+    "csp.withgoogle.com",
+    "dartsearch.net",
+    "developers.google.com",
+    "doubleclick-cn.net",
+    "doubleclick.de",
+    "doubleclick.ne.jp",
+    "doubleclick.net",
+    "doubleclick.com",
+    "doubleclickbygoogle.com",
+    "firebase.google.com",
+    "fundingchoicesmessages.google.com",
+    "g.doubleclick.net",
+    "google-analytics-cn.com",
+    "google-analytics.com",
+    "googleadservices-cn.com",
+    "googleadservices.com",
+    "googleads-cn.com",
+    "googleads.com",
+    "googleadsserving.cn",
+    "googleapis.cn",
+    "googleapis.com",
+    "googlesyndication-cn.com",
+    "googlesyndication.com",
+    "googletagmanager-cn.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    "gstatic-cn.com",
+    "gstatic.cn",
+    "gstatic.com",
+    "gvt1.com",
+    "mobileads.google.com",
+    "pagead2.googlesyndication.com",
+    "play.googleapis.com",
+    "pubads.g.doubleclick.net",
+    "securepubads.g.doubleclick.net",
+    "support.google.com",
+    "tpc.googlesyndication.com",
+    "partner.googleadservices.com",
+    "stats.g.doubleclick.net",
+    "pagead.l.doubleclick.net",
+    "googleusercontent.com",
+    "merchant-center-analytics.goog",
+    "mediation.goog",
+    "ssl.google-analytics.com",
+    "syndicatedsearch.goog",
+    "tagassistant.google.com",
+    "tagmanager.google.com",
+    "www.google.com",
+    "redirector.googlevideo.com",
+    "i.ytimg.com",
+    "yt3.ggpht.com",
+
+    "browserleaks.com", "aparatvpn.com",
+
+    "stun.l.google.com",
+    "stun1.l.google.com",
+    "stun2.l.google.com",
+    "stun3.l.google.com",
+    "stun4.l.google.com",
+]
+
+# dnsmasq matches a configured domain and its subdomains, but it cannot match
+# the same label across arbitrary TLDs. Keep Google's published regional
+# adservice endpoints explicit and auditable. Source (2026-09-03):
+# https://www.google.com/supported_domains
+IPSET_PREWARM_BASE_DOMAINS = tuple(DOMAINS)
+GOOGLE_ADSERVICE_REGIONAL_DOMAINS = """
+adservice.google.ad
+adservice.google.ae
+adservice.google.al
+adservice.google.am
+adservice.google.as
+adservice.google.at
+adservice.google.az
+adservice.google.ba
+adservice.google.be
+adservice.google.bf
+adservice.google.bg
+adservice.google.bi
+adservice.google.bj
+adservice.google.bs
+adservice.google.bt
+adservice.google.by
+adservice.google.ca
+adservice.google.cat
+adservice.google.cd
+adservice.google.cf
+adservice.google.cg
+adservice.google.ch
+adservice.google.ci
+adservice.google.cl
+adservice.google.cm
+adservice.google.cn
+adservice.google.co.ao
+adservice.google.co.bw
+adservice.google.co.ck
+adservice.google.co.cr
+adservice.google.co.id
+adservice.google.co.il
+adservice.google.co.in
+adservice.google.co.jp
+adservice.google.co.ke
+adservice.google.co.kr
+adservice.google.co.ls
+adservice.google.co.ma
+adservice.google.co.mz
+adservice.google.co.nz
+adservice.google.co.th
+adservice.google.co.tz
+adservice.google.co.ug
+adservice.google.co.uk
+adservice.google.co.uz
+adservice.google.co.ve
+adservice.google.co.vi
+adservice.google.co.za
+adservice.google.co.zm
+adservice.google.co.zw
+adservice.google.com
+adservice.google.com.af
+adservice.google.com.ag
+adservice.google.com.ar
+adservice.google.com.au
+adservice.google.com.bd
+adservice.google.com.bh
+adservice.google.com.bn
+adservice.google.com.bo
+adservice.google.com.br
+adservice.google.com.bz
+adservice.google.com.co
+adservice.google.com.cu
+adservice.google.com.cy
+adservice.google.com.do
+adservice.google.com.ec
+adservice.google.com.eg
+adservice.google.com.et
+adservice.google.com.fj
+adservice.google.com.gh
+adservice.google.com.gi
+adservice.google.com.gt
+adservice.google.com.hk
+adservice.google.com.jm
+adservice.google.com.kh
+adservice.google.com.kw
+adservice.google.com.lb
+adservice.google.com.ly
+adservice.google.com.mm
+adservice.google.com.mt
+adservice.google.com.mx
+adservice.google.com.my
+adservice.google.com.na
+adservice.google.com.ng
+adservice.google.com.ni
+adservice.google.com.np
+adservice.google.com.om
+adservice.google.com.pa
+adservice.google.com.pe
+adservice.google.com.pg
+adservice.google.com.ph
+adservice.google.com.pk
+adservice.google.com.pr
+adservice.google.com.py
+adservice.google.com.qa
+adservice.google.com.sa
+adservice.google.com.sb
+adservice.google.com.sg
+adservice.google.com.sl
+adservice.google.com.sv
+adservice.google.com.tj
+adservice.google.com.tr
+adservice.google.com.tw
+adservice.google.com.ua
+adservice.google.com.uy
+adservice.google.com.vc
+adservice.google.com.vn
+adservice.google.cv
+adservice.google.cz
+adservice.google.de
+adservice.google.dj
+adservice.google.dk
+adservice.google.dm
+adservice.google.dz
+adservice.google.ee
+adservice.google.es
+adservice.google.fi
+adservice.google.fm
+adservice.google.fr
+adservice.google.ga
+adservice.google.ge
+adservice.google.gg
+adservice.google.gl
+adservice.google.gm
+adservice.google.gr
+adservice.google.gy
+adservice.google.hn
+adservice.google.hr
+adservice.google.ht
+adservice.google.hu
+adservice.google.ie
+adservice.google.im
+adservice.google.iq
+adservice.google.is
+adservice.google.it
+adservice.google.je
+adservice.google.jo
+adservice.google.kg
+adservice.google.ki
+adservice.google.kz
+adservice.google.la
+adservice.google.li
+adservice.google.lk
+adservice.google.lt
+adservice.google.lu
+adservice.google.lv
+adservice.google.md
+adservice.google.me
+adservice.google.mg
+adservice.google.mk
+adservice.google.ml
+adservice.google.mn
+adservice.google.mu
+adservice.google.mv
+adservice.google.mw
+adservice.google.ne
+adservice.google.nl
+adservice.google.no
+adservice.google.nr
+adservice.google.nu
+adservice.google.pl
+adservice.google.pn
+adservice.google.ps
+adservice.google.pt
+adservice.google.ro
+adservice.google.rs
+adservice.google.ru
+adservice.google.rw
+adservice.google.sc
+adservice.google.se
+adservice.google.sh
+adservice.google.si
+adservice.google.sk
+adservice.google.sm
+adservice.google.sn
+adservice.google.so
+adservice.google.sr
+adservice.google.st
+adservice.google.td
+adservice.google.tg
+adservice.google.tl
+adservice.google.tm
+adservice.google.tn
+adservice.google.to
+adservice.google.tt
+adservice.google.vu
+adservice.google.ws
+""".split()
+
+# Regional roots in ad-specific Google families. Each entry was verified
+# against authoritative DNS with a Google-operated SOA on 2026-09-03.
+GOOGLE_OWNED_REGIONAL_AD_DOMAINS = """
+2mdn.com
+admob.co.id
+admob.co.in
+admob.co.kr
+admob.co.nz
+admob.co.uk
+admob.co.za
+admob.com
+admob.com.au
+admob.com.br
+admob.com.hk
+admob.com.mx
+admob.com.my
+admob.com.ph
+admob.com.sg
+admob.com.tr
+admob.com.tw
+admob.com.vn
+admob.de
+admob.dk
+admob.es
+admob.fi
+admob.fr
+admob.gr
+admob.ie
+admob.it
+admob.me
+admob.mg
+admob.nl
+admob.no
+admob.pt
+admob.so
+doubleclick.al
+doubleclick.am
+doubleclick.as
+doubleclick.by
+doubleclick.cd
+doubleclick.cf
+doubleclick.cg
+doubleclick.ch
+doubleclick.cn
+doubleclick.co.ck
+doubleclick.co.id
+doubleclick.co.jp
+doubleclick.co.uk
+doubleclick.co.vi
+doubleclick.com
+doubleclick.com.ag
+doubleclick.com.et
+doubleclick.com.gt
+doubleclick.com.hk
+doubleclick.com.mt
+doubleclick.com.mx
+doubleclick.com.pa
+doubleclick.com.pr
+doubleclick.com.sb
+doubleclick.com.sv
+doubleclick.com.tw
+doubleclick.de
+doubleclick.dk
+doubleclick.dm
+doubleclick.fr
+doubleclick.ga
+doubleclick.gm
+doubleclick.lk
+doubleclick.lt
+doubleclick.lv
+doubleclick.mg
+doubleclick.mw
+doubleclick.nl
+doubleclick.pl
+doubleclick.rw
+doubleclick.sh
+doubleclick.so
+doubleclick.sr
+doubleclick.st
+googleads.ae
+googleads.al
+googleads.as
+googleads.az
+googleads.bg
+googleads.by
+googleads.cd
+googleads.ci
+googleads.cl
+googleads.cm
+googleads.co.cr
+googleads.co.ke
+googleads.co.ma
+googleads.co.mz
+googleads.co.uz
+googleads.co.ve
+googleads.com
+googleads.com.ag
+googleads.com.au
+googleads.com.bo
+googleads.com.do
+googleads.com.ec
+googleads.com.gt
+googleads.com.hk
+googleads.com.jm
+googleads.com.mt
+googleads.com.ng
+googleads.com.om
+googleads.com.pe
+googleads.com.ph
+googleads.com.pk
+googleads.com.pr
+googleads.com.sg
+googleads.com.sv
+googleads.com.ua
+googleads.fm
+googleads.ga
+googleads.gg
+googleads.gl
+googleads.gy
+googleads.hn
+googleads.hr
+googleads.im
+googleads.je
+googleads.jo
+googleads.kg
+googleads.la
+googleads.li
+googleads.mn
+googleads.mu
+googleads.mw
+googleads.ps
+googleads.sc
+googleads.sh
+googleads.so
+googleads.st
+googleads.tg
+googleads.tl
+googleads.tm
+googleads.tn
+googleads.to
+googleads.tt
+googleads.ws
+googleadservices.com
+googleadsserving.cn
+googlesyndication.ca
+googlesyndication.cn
+googlesyndication.co.uk
+googlesyndication.com
+googlesyndication.com.au
+googlesyndication.com.br
+googlesyndication.it
+""".split()
+
+DOMAINS = list(dict.fromkeys(
+    DOMAINS
+    + GOOGLE_ADSERVICE_REGIONAL_DOMAINS
+    + GOOGLE_OWNED_REGIONAL_AD_DOMAINS
+))
+
+# Some clients resolve through browser DNS cache or DoH, so dnsmasq never sees
+# their query. Resolve critical route domains locally as well and seed ipset.
+IPSET_PREWARM_DOMAINS = tuple(dict.fromkeys(
+    list(IPSET_PREWARM_BASE_DOMAINS)
+    + ["www.browserleaks.com", "tls.browserleaks.com"]
+))
+
+FULL_ROUTE_TO_PROXY = True
+block_udp = True
 
 
-GIB = 1024 ** 3
-BASELINE_MEMORY_GIB = 2
-DEDICATED_MULTI_COMPATIBLE = True
-DEDICATED_CONNTRACK_RAM_V2 = True
-CONNTRACK_RAM_DIVISOR = 16
-CONNTRACK_FLOW_BYTES = 1024
-CONNTRACK_BUCKET_BYTES = 16
-CONNTRACK_ENTRY_QUANTUM = 1024
-# Conservative signed-int envelope for Linux sysctl/module interfaces.
-CONNTRACK_NATIVE_MAX = (1 << 31) - 1
-# nf_ct_alloc_hashtable checks UINT_MAX / sizeof(hlist_nulls_head).
-# Use the 64-bit head size (8 bytes), also conservative on 32-bit systems.
-CONNTRACK_HASH_NATIVE_MAX = ((1 << 32) - 1) // 8
-CONNTRACK_HASH_PATH = Path("/sys/module/nf_conntrack/parameters/hashsize")
-CONNTRACK_MAX_KEY = "net.netfilter.nf_conntrack_max"
-CONNTRACK_COUNT_KEY = "net.netfilter.nf_conntrack_count"
-
-
-class CapacityProfile(NamedTuple):
-    name: str
-    memory_bytes: int
-    memory_gib: int
-    scale: float
-    system_file_max: int
-    kernel_nr_open: int
-    process_nofile: int
-    process_nproc: int
-    service_tasks_max: int
-    kernel_threads_max: int
-    vm_max_map_count: int
-    conntrack_max: int
-    conntrack_hashsize: int
-    netdev_backlog: int
-    netdev_budget: int
-    syn_backlog: int
-    tw_buckets: int
-    tcp_max_orphans: int
-    socket_buffer_max: int
-
-
-def cgroup_memory_limit_paths() -> List[Path]:
-    """Locate our v1/v2 memory controller and every visible ancestor limit."""
-    paths = {Path("/sys/fs/cgroup/memory.max"),
-             Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")}
+# ---------------- Helpers ----------------
+def run_cmd(cmd, check=False, timeout=300):
+    print(f"[+] Running: {cmd}")
     try:
-        membership = Path("/proc/self/cgroup").read_text(encoding="ascii")
-        mounts = Path("/proc/self/mountinfo").read_text(encoding="ascii")
-    except FileNotFoundError:
-        return sorted(paths)
-
-    groups = {}
-    for line in membership.splitlines():
-        parts = line.split(":", 2)
-        if len(parts) != 3:
-            raise ValueError("Malformed /proc/self/cgroup")
-        for controller in parts[1].split(","):
-            if controller in ("", "memory"):
-                group = PurePosixPath(parts[2])
-                if not group.is_absolute() or ".." in group.parts:
-                    raise ValueError("Invalid cgroup membership path")
-                groups[controller] = group
-
-    mounted, mapped = set(), set()
-    for line in mounts.splitlines():
-        before, separator, after = line.partition(" - ")
-        fields, filesystem = before.split(), after.split()
-        if not separator or len(fields) < 6 or len(filesystem) < 3:
-            raise ValueError("Malformed /proc/self/mountinfo")
-        if filesystem[0] == "cgroup2":
-            controller, filename = "", "memory.max"
-        elif filesystem[0] == "cgroup" and "memory" in filesystem[2].split(","):
-            controller, filename = "memory", "memory.limit_in_bytes"
-        else:
-            continue
-        if controller not in groups:
-            continue
-        mounted.add(controller)
-        def unescape(value):
-            return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), value)
-        root = PurePosixPath(unescape(fields[3]))
-        mount = Path(unescape(fields[4]))
-        if not root.is_absolute() or not mount.is_absolute() or ".." in root.parts + mount.parts:
-            raise ValueError("Invalid cgroup mount path")
-        group = groups[controller]
-        try:
-            relative = group.relative_to(root)
-        except ValueError:
-            if group != PurePosixPath("/"):
-                continue
-            # A cgroup namespace may expose its own root as '/' in membership.
-            relative = PurePosixPath(".")
-        mapped.add(controller)
-        current = mount / relative
-        while True:
-            paths.add(current / filename)
-            if current == mount:
-                break
-            current = current.parent
-    if mounted - mapped:
-        raise ValueError("Cannot resolve current cgroup memory hierarchy; refusing to guess")
-    return sorted(paths)
-
-
-def parse_memory_limit(raw: str, label: str) -> Optional[int]:
-    value = raw.strip()
-    if value == "max":
+        result = subprocess.run(cmd, shell=True, check=True,
+                                capture_output=True, text=True, timeout=timeout)
+        if result.stdout:
+            print(result.stdout.strip())
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"[!] Error: {cmd}")
+        if e.stderr:
+            print(e.stderr.strip())
+        if check:
+            raise
+        return e
+    except subprocess.TimeoutExpired:
+        print(f"[!] Timeout after {timeout}s: {cmd}")
+        if check:
+            raise
         return None
-    if not re.fullmatch(r"[0-9]{1,20}", value) or int(value) <= 0:
-        raise ValueError(f"Invalid memory ceiling at {label}; refusing to guess")
-    number = int(value)
-    if number > (1 << 63) - 1:
-        raise ValueError(f"Memory ceiling out of range at {label}")
-    # v1 represents an unlimited ceiling with a page-aligned LONG_MAX.
-    return None if number >= 1 << 60 else number
 
 
-def detect_total_memory_bytes() -> int:
-    """Return host RAM clamped by finite cgroup limits, never MemAvailable."""
-    candidates: List[int] = []
+def run_cmd_return(cmd):
+    print(f"[+] Running: {cmd}")
     try:
-        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
-            match = re.fullmatch(r"MemTotal:\s+([0-9]+) kB", line.strip())
-            if match and int(match[1]) > 0:
-                candidates.append(int(match[1]) * 1024)
-                break
-    except (OSError, ValueError, IndexError):
-        pass
-
-    try:
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        if pages > 0 and page_size > 0:
-            candidates.append(int(pages) * int(page_size))
-    except (OSError, ValueError):
-        pass
-
-    if not candidates:
-        candidates.append(4 * GIB)
-    for path in cgroup_memory_limit_paths():
-        try:
-            raw = path.read_text(encoding="ascii").strip()
-        except FileNotFoundError:
-            continue
-        value = parse_memory_limit(raw, str(path))
-        if value is not None:
-            candidates.append(value)
-
-    return min(candidates)
-
-
-def lower_power_of_two(value: int) -> int:
-    if value < 1:
-        return 1
-    return 1 << (value.bit_length() - 1)
-
-
-def conntrack_hashsize(entries: int) -> int:
-    buckets = max(1024, (entries + 3) // 4)
-    return 1 << (buckets - 1).bit_length()
-
-
-def conntrack_memory_cost(entries: int, buckets: int, old_buckets: int = 0) -> int:
-    # Reserve two tables for resize; an existing larger table must also fit.
-    return (entries * CONNTRACK_FLOW_BYTES +
-            (buckets + max(buckets, old_buckets)) * CONNTRACK_BUCKET_BYTES)
-
-
-def build_conntrack_capacity(memory_bytes: int) -> Tuple[int, int]:
-    if type(memory_bytes) is not int or memory_bytes <= 0:
-        raise ValueError("Effective RAM must be a positive integer byte count")
-    budget = memory_bytes // CONNTRACK_RAM_DIVISOR
-    low = 0
-    high = min(CONNTRACK_NATIVE_MAX, budget // CONNTRACK_FLOW_BYTES) // CONNTRACK_ENTRY_QUANTUM
-    while low < high:
-        middle = (low + high + 1) // 2
-        entries = middle * CONNTRACK_ENTRY_QUANTUM
-        buckets = conntrack_hashsize(entries)
-        if buckets <= CONNTRACK_HASH_NATIVE_MAX and conntrack_memory_cost(entries, buckets) <= budget:
-            low = middle
-        else:
-            high = middle - 1
-    if not low:
-        raise ValueError("Effective RAM is too small for the conntrack budget")
-    entries = low * CONNTRACK_ENTRY_QUANTUM
-    return entries, conntrack_hashsize(entries)
-
-
-def scale_from_baseline(
-    base: int,
-    memory_gib: int,
-    maximum: int,
-    minimum: int = 0,
-) -> int:
-    """Scale the original 2 GiB profile linearly, with a safety ceiling."""
-    floor = minimum if minimum > 0 else max(1, base // 4)
-    return min(
-        maximum,
-        max(floor, (base * memory_gib) // BASELINE_MEMORY_GIB),
-    )
-
-
-def build_capacity_profile(memory_bytes: int) -> CapacityProfile:
-    conntrack_max, hashsize = build_conntrack_capacity(memory_bytes)
-    # VPS providers advertise rounded GiB values while Linux reports slightly
-    # less, so use nearest-GiB sizing rather than truncating a 4 GiB VPS to 3.
-    memory_gib = max(1, int((memory_bytes + GIB // 2) // GIB))
-
-    if memory_gib <= 2:
-        name = "small"
-    elif memory_gib <= 4:
-        name = "standard"
-    elif memory_gib <= 8:
-        name = "medium"
-    elif memory_gib <= 16:
-        name = "large"
-    elif memory_gib <= 32:
-        name = "high-capacity"
-    else:
-        name = "dedicated"
-
-    # These first three baselines are the exact values from the user's original
-    # 2 GiB script. Missing network limits use conservative 2 GiB baselines.
-    system_file_max = scale_from_baseline(2_097_152, memory_gib, 67_108_864)
-    process_nofile = scale_from_baseline(1_048_576, memory_gib, 8_388_608)
-    process_nproc = scale_from_baseline(262_144, memory_gib, 2_097_152)
-    service_tasks_max = scale_from_baseline(16_384, memory_gib, 131_072)
-    kernel_threads_max = scale_from_baseline(131_072, memory_gib, 1_048_576)
-    vm_max_map_count = scale_from_baseline(262_144, memory_gib, 1_048_576)
-    netdev_backlog = scale_from_baseline(65_536, memory_gib, 500_000)
-    netdev_budget = scale_from_baseline(600, memory_gib, 2_400)
-    syn_backlog = scale_from_baseline(8_192, memory_gib, 131_072)
-    tw_buckets = scale_from_baseline(262_144, memory_gib, 2_000_000)
-    tcp_max_orphans = scale_from_baseline(262_144, memory_gib, 2_000_000)
-    socket_buffer_max = scale_from_baseline(
-        32 * 1024 ** 2,
-        memory_gib,
-        128 * 1024 ** 2,
-    )
-
-    return CapacityProfile(
-        name=name,
-        memory_bytes=memory_bytes,
-        memory_gib=memory_gib,
-        scale=memory_gib / float(BASELINE_MEMORY_GIB),
-        system_file_max=system_file_max,
-        kernel_nr_open=process_nofile,
-        process_nofile=process_nofile,
-        process_nproc=process_nproc,
-        service_tasks_max=service_tasks_max,
-        kernel_threads_max=kernel_threads_max,
-        vm_max_map_count=vm_max_map_count,
-        conntrack_max=conntrack_max,
-        conntrack_hashsize=hashsize,
-        netdev_backlog=netdev_backlog,
-        netdev_budget=netdev_budget,
-        syn_backlog=syn_backlog,
-        tw_buckets=tw_buckets,
-        tcp_max_orphans=tcp_max_orphans,
-        socket_buffer_max=socket_buffer_max,
-    )
-
-
-PROFILE = build_capacity_profile(detect_total_memory_bytes())
-SYSTEM_FILE_MAX = PROFILE.system_file_max
-PROCESS_NOFILE = PROFILE.process_nofile
-PROCESS_NPROC = PROFILE.process_nproc
-SERVICE_TASKS_MAX = PROFILE.service_tasks_max
-CONNTRACK_MAX = PROFILE.conntrack_max
-CONNTRACK_HASHSIZE = PROFILE.conntrack_hashsize
-DEFAULT_REFRESH_SECONDS = 300
-
-PROCESS_NAMES = (
-    "nginx",
-    "stunnel",
-    "stunnel4",
-    "openvpn",
-    "tun2socks",
-    "dnsmasq",
-)
-
-STATIC_SERVICE_UNITS = (
-    "nginx.service",
-    "stunnel.service",
-    "stunnel4.service",
-    "openvpn.service",
-    "openvpn-server.service",
-    "tun2socks.service",
-    "dnsmasq.service",
-    "pm2-root.service",
-)
-
-STATIC_TEMPLATE_UNITS = (
-    "openvpn@.service",
-    "openvpn-server@.service",
-    "xd-stunnel-pool@.service",
-)
-
-SERVICE_UNIT_PREFIXES = (
-    "openvpn",
-    "xd-stunnel-pool@",
-    "xd-tun2socks-",
-    "xd-dnsmasq-",
-)
-
-SYSCTLS: Dict[str, str] = {
-    "fs.file-max": str(SYSTEM_FILE_MAX),
-    "fs.nr_open": str(PROFILE.kernel_nr_open),
-    "kernel.pid_max": "4194304",
-    "kernel.threads-max": str(PROFILE.kernel_threads_max),
-    "vm.max_map_count": str(PROFILE.vm_max_map_count),
-    "net.core.default_qdisc": "fq",
-    "net.core.somaxconn": "65535",
-    "net.core.netdev_budget": str(PROFILE.netdev_budget),
-    "net.core.netdev_budget_usecs": "8000",
-    "net.core.netdev_max_backlog": str(PROFILE.netdev_backlog),
-    "net.core.optmem_max": "4194304",
-    "net.core.rmem_max": str(PROFILE.socket_buffer_max),
-    "net.core.wmem_max": str(PROFILE.socket_buffer_max),
-    "net.ipv4.ip_forward": "1",
-    "net.ipv4.ip_local_port_range": "1024 65535",
-    "net.ipv4.tcp_fin_timeout": "15",
-    "net.ipv4.tcp_keepalive_time": "600",
-    "net.ipv4.tcp_keepalive_intvl": "30",
-    "net.ipv4.tcp_keepalive_probes": "5",
-    "net.ipv4.tcp_max_syn_backlog": str(PROFILE.syn_backlog),
-    "net.ipv4.tcp_max_orphans": str(PROFILE.tcp_max_orphans),
-    "net.ipv4.tcp_max_tw_buckets": str(PROFILE.tw_buckets),
-    "net.ipv4.tcp_mtu_probing": "1",
-    "net.ipv4.tcp_rmem": f"4096 87380 {PROFILE.socket_buffer_max}",
-    "net.ipv4.tcp_slow_start_after_idle": "0",
-    "net.ipv4.tcp_syncookies": "1",
-    "net.ipv4.tcp_tw_reuse": "1",
-    "net.ipv4.tcp_wmem": f"4096 65536 {PROFILE.socket_buffer_max}",
-    "net.netfilter.nf_conntrack_tcp_timeout_close_wait": "60",
-    "net.netfilter.nf_conntrack_tcp_timeout_established": "7200",
-    "net.netfilter.nf_conntrack_tcp_timeout_fin_wait": "60",
-    "net.netfilter.nf_conntrack_tcp_timeout_time_wait": "30",
-    "net.netfilter.nf_conntrack_udp_timeout": "30",
-    "net.netfilter.nf_conntrack_udp_timeout_stream": "120",
-}
-
-STOP_REQUESTED = False
-
-
-def log(message: str) -> None:
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{stamp}] {message}", flush=True)
-
-
-def run(command: Sequence[str], timeout: int = 30) -> subprocess.CompletedProcess:
-    args = list(command)
-    try:
-        return subprocess.run(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True
         )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        detail = f"command timed out after {timeout}s"
-        stderr = f"{stderr.rstrip()}\n{detail}".strip()
-        return subprocess.CompletedProcess(args, 124, stdout, stderr)
+        output = result.stdout if result.stdout else ""
+        print(output, end="")  # نشان دادن در ترمینال
+        return output  # برگرداندن همان خروجی
+
+    except subprocess.CalledProcessError as e:
+        error = e.stderr if e.stderr else ""
+        print(error, end="")  # چاپ مثل ترمینال
+        return error  # برگرداندن همان متن خطا
+
+
+def write_text_if_changed(path, content, mode=0o644):
+    target = Path(path)
+    if target.exists() and target.read_text() == content:
+        os.chmod(target, mode)
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp")
+    temporary.write_text(content)
+    os.chmod(temporary, mode)
+    os.replace(temporary, target)
+    return True
+
+
+def load_managed_float_states(state_dir=FLOAT_STATE_DIR):
+    """Load the floating IPs already supplied by the dedicated host manager."""
+    states = {}
+    try:
+        state_files = sorted(state_dir.glob("host-*.ips"))
     except OSError as exc:
-        return subprocess.CompletedProcess(args, 127, "", str(exc))
+        print(f"[!] Could not inspect floating-IP state: {exc}")
+        return states
+
+    for state_file in state_files:
+        match = re.fullmatch(r"host-(\d+)\.ips", state_file.name)
+        if not match:
+            continue
+        try:
+            lines = state_file.read_text(encoding="ascii").splitlines()
+        except OSError as exc:
+            print(f"[!] Could not read {state_file}: {exc}")
+            continue
+
+        addresses = set()
+        for line in lines:
+            raw_address = line.split("#", 1)[0].strip()
+            if not raw_address:
+                continue
+            try:
+                address = ipaddress.ip_address(raw_address.split("/", 1)[0])
+            except ValueError:
+                print(f"[!] Ignoring invalid floating IP in {state_file}: {raw_address}")
+                continue
+            if isinstance(address, ipaddress.IPv4Address):
+                addresses.add(str(address))
+        if addresses:
+            states[match.group(1)] = addresses
+    return states
 
 
-def require_root() -> None:
-    if os.geteuid() != 0:
-        raise SystemExit("Run this script as root")
-
-
-def load_conntrack() -> Tuple[bool, str]:
-    result = run(["modprobe", "nf_conntrack"])
-    if result.returncode != 0:
-        return False, result.stderr.strip() or "modprobe nf_conntrack failed"
-    return True, "loaded"
-
-
-def native_conntrack_value(raw: str, label: str, minimum: int = 1,
-                           maximum: int = CONNTRACK_NATIVE_MAX) -> int:
-    if not re.fullmatch(r"[0-9]{1,10}", raw.strip()):
-        raise ValueError(f"Invalid {label} readback")
-    value = int(raw)
-    if not minimum <= value <= maximum:
-        raise ValueError(f"{label} outside native integer bounds")
-    return value
-
-
-def read_conntrack_value(key: str, minimum: int = 1) -> int:
-    result = run(["sysctl", "-n", key])
-    if result.returncode:
-        raise ValueError(f"Cannot read {key}: {result.stderr.strip() or result.returncode}")
-    return native_conntrack_value(result.stdout, key, minimum)
-
-
-def read_conntrack_hashsize() -> int:
-    return native_conntrack_value(CONNTRACK_HASH_PATH.read_text(encoding="ascii"),
-                                  "hashsize", maximum=CONNTRACK_HASH_NATIVE_MAX)
-
-
-def check_conntrack_occupancy() -> int:
-    count = read_conntrack_value(CONNTRACK_COUNT_KEY, 0)
-    if count > CONNTRACK_MAX:
-        raise ValueError(f"Resize deferred: measured count {count} exceeds proposed {CONNTRACK_MAX}")
-    return count
-
-
-def set_conntrack_hashsize(expected_before: Optional[int] = None) -> Tuple[bool, str]:
-    try:
-        native_conntrack_value(str(CONNTRACK_HASHSIZE), "proposed hashsize",
-                              maximum=CONNTRACK_HASH_NATIVE_MAX)
-        before = read_conntrack_hashsize()
-        if expected_before is not None and before != expected_before:
-            raise ValueError("Hashsize changed concurrently; resize deferred")
-        if before != CONNTRACK_HASHSIZE:
-            if before > CONNTRACK_HASHSIZE:
-                check_conntrack_occupancy()
-            if conntrack_memory_cost(CONNTRACK_MAX, CONNTRACK_HASHSIZE, before) > PROFILE.memory_bytes // CONNTRACK_RAM_DIVISOR:
-                raise ValueError("Existing hash resize overlap exceeds RAM budget; resize deferred")
-            CONNTRACK_HASH_PATH.write_text(str(CONNTRACK_HASHSIZE), encoding="ascii")
-        after = read_conntrack_hashsize()
-    except (OSError, ValueError) as exc:
-        return False, str(exc)
-    return after == CONNTRACK_HASHSIZE, f"hashsize {before} -> {after}, proposed={CONNTRACK_HASHSIZE}"
-
-
-def set_conntrack_max(expected_before: int) -> None:
-    before = read_conntrack_value(CONNTRACK_MAX_KEY)
-    if before != expected_before:
-        raise ValueError("Conntrack maximum changed concurrently; resize deferred")
-    if before != CONNTRACK_MAX:
-        if before > CONNTRACK_MAX:
-            check_conntrack_occupancy()
-        result = run(["sysctl", "-q", "-w", f"{CONNTRACK_MAX_KEY}={CONNTRACK_MAX}"])
-        if result.returncode:
-            raise ValueError(f"Conntrack maximum write failed: {result.stderr.strip() or result.returncode}")
-    after = read_conntrack_value(CONNTRACK_MAX_KEY)
-    if after != CONNTRACK_MAX:
-        raise ValueError(f"Conntrack maximum readback {after} != proposed {CONNTRACK_MAX}")
-
-
-def apply_conntrack_capacity() -> Tuple[bool, str]:
-    """Grow the hash before admission; lower admission before shrinking the hash.
-
-    Refuse unsafe downward changes without flushing established flows. These
-    read/verify guards detect races but cannot atomically freeze live traffic.
-    A partial failure keeps the successfully verified stage and reports failure;
-    no blind rollback may shrink a table now needed by newly admitted flows.
-    """
-    try:
-        native_conntrack_value(str(CONNTRACK_MAX), "proposed conntrack maximum")
-        native_conntrack_value(str(CONNTRACK_HASHSIZE), "proposed hashsize",
-                              maximum=CONNTRACK_HASH_NATIVE_MAX)
-        if CONNTRACK_HASHSIZE != conntrack_hashsize(CONNTRACK_MAX):
-            raise ValueError("Proposed hashsize does not match conntrack capacity")
-        count = check_conntrack_occupancy()
-        before = read_conntrack_value(CONNTRACK_MAX_KEY)
-        old_hash = read_conntrack_hashsize()
-        cost = conntrack_memory_cost(CONNTRACK_MAX, CONNTRACK_HASHSIZE, old_hash)
-        if cost > PROFILE.memory_bytes // CONNTRACK_RAM_DIVISOR:
-            raise ValueError("Proposed flows plus existing hash resize overlap exceed RAM budget")
-        log(f"conntrack measured={count}/{before} hashsize={old_hash}; "
-            f"proposed={CONNTRACK_MAX} hashsize={CONNTRACK_HASHSIZE} "
-            f"estimated_peak_bytes={cost} budget_bytes={PROFILE.memory_bytes // CONNTRACK_RAM_DIVISOR}")
-        if before > CONNTRACK_MAX:
-            set_conntrack_max(before)
-        hash_ok, detail = set_conntrack_hashsize(expected_before=old_hash)
-        if not hash_ok:
-            raise ValueError(f"Conntrack hash verification failed: {detail}")
-        if before <= CONNTRACK_MAX:
-            set_conntrack_max(before)
-        actual_max = read_conntrack_value(CONNTRACK_MAX_KEY)
-        actual_hash = read_conntrack_hashsize()
-        readback = (f"desired_max={CONNTRACK_MAX} effective_max={actual_max} "
-                    f"desired_hashsize={CONNTRACK_HASHSIZE} effective_hashsize={actual_hash}")
-        if actual_max != CONNTRACK_MAX or actual_hash != CONNTRACK_HASHSIZE:
-            raise ValueError(f"Conntrack final readback differs: {readback}")
-        count = check_conntrack_occupancy()
-        return True, f"{readback} measured_count={count}"
-    except (OSError, ValueError) as exc:
-        return False, str(exc)
-
-
-def apply_sysctls() -> Tuple[int, List[str]]:
-    success = 0
-    errors: List[str] = []
-    for key, value in SYSCTLS.items():
-        result = run(["sysctl", "-q", "-w", f"{key}={value}"])
-        if result.returncode == 0:
-            success += 1
-        else:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-            errors.append(f"{key}: {detail}")
-    return success, errors
-
-
-def list_running_units() -> List[str]:
-    result = run(
-        [
-            "systemctl",
-            "list-units",
-            "--type=service",
-            "--state=running",
-            "--no-legend",
-            "--plain",
-        ]
+def primary_source_ipv4():
+    """Return the IPv4 address the host uses for ordinary Internet traffic."""
+    result = subprocess.run(
+        ["ip", "-4", "route", "get", "1.1.1.1"],
+        capture_output=True,
+        text=True,
+        timeout=20,
     )
     if result.returncode != 0:
-        return []
-    units: List[str] = []
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if fields and fields[0].endswith(".service"):
-            units.append(fields[0])
-    return units
+        raise RuntimeError(result.stderr.strip() or "could not determine primary IPv4")
+    match = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)\b", result.stdout)
+    if not match:
+        raise RuntimeError("primary IPv4 was not present in the route result")
+    address = ipaddress.ip_address(match.group(1))
+    if not isinstance(address, ipaddress.IPv4Address):
+        raise RuntimeError("primary address is not IPv4")
+    return str(address)
 
 
-def target_units() -> List[str]:
-    running = list_running_units()
-    selected = set()
-    for unit in running:
-        if unit in STATIC_SERVICE_UNITS or unit.startswith(SERVICE_UNIT_PREFIXES):
-            selected.add(unit)
-    return sorted(selected)
-
-
-def list_installed_service_units() -> List[str]:
-    result = run(
-        [
-            "systemctl",
-            "list-unit-files",
-            "--type=service",
-            "--no-legend",
-            "--plain",
-        ]
-    )
-    if result.returncode != 0:
-        return []
+def split_pool_tokens(raw_value):
     return [
-        line.split()[0]
-        for line in result.stdout.splitlines()
-        if line.split() and line.split()[0].endswith(".service")
+        token.strip().strip("\\")
+        for token in re.split(r"[,;\s]+", str(raw_value or ""))
+        if token.strip().strip("\\")
     ]
 
 
-def configured_units(running_units: Iterable[str]) -> List[str]:
-    installed = set(list_installed_service_units())
-    selected = set(running_units)
-    selected.update(unit for unit in STATIC_SERVICE_UNITS if unit in installed)
-    selected.update(unit for unit in STATIC_TEMPLATE_UNITS if unit in installed)
-    return sorted(selected)
+def expand_ip_token(token, max_addresses=MAX_FLOAT_IPS):
+    token = token.strip()
+    if not token:
+        return []
+
+    if "-" in token and "/" not in token:
+        start_raw, end_raw = token.split("-", 1)
+        start = ipaddress.ip_address(start_raw.strip())
+        end = ipaddress.ip_address(end_raw.strip())
+        if not isinstance(start, ipaddress.IPv4Address) or not isinstance(end, ipaddress.IPv4Address):
+            raise ValueError("only IPv4 ranges are supported")
+        count = int(end) - int(start) + 1
+        if count <= 0 or count > max_addresses:
+            raise ValueError(f"invalid or oversized IPv4 range: {token}")
+        return [str(ipaddress.ip_address(value)) for value in range(int(start), int(end) + 1)]
+
+    if "/" in token:
+        network = ipaddress.ip_network(token, strict=False)
+        if not isinstance(network, ipaddress.IPv4Network):
+            raise ValueError("only IPv4 networks are supported")
+        if network.num_addresses > max_addresses + 2:
+            raise ValueError(f"oversized IPv4 network: {token}")
+        return [str(address) for address in network.hosts()]
+
+    address = ipaddress.ip_address(token)
+    if not isinstance(address, ipaddress.IPv4Address):
+        raise ValueError("only IPv4 addresses are supported")
+    return [str(address)]
 
 
-def service_task_limit(unit: str) -> str:
-    # Keep the dedicated installer's per-worker cgroups unbounded. RAM-aware
-    # kernel/FD limits remain finite; this does not reserve memory or spawn tasks.
-    if unit.startswith(('xd-stunnel-pool@', 'openvpn@', 'openvpn-server@')):
-        return 'infinity'
-    return str(SERVICE_TASKS_MAX)
-
-
-def write_runtime_service_drop_in(unit: str) -> None:
-    drop_in_dir = Path("/run/systemd/system") / f"{unit}.d"
-    drop_in_dir.mkdir(parents=True, exist_ok=True)
-    destination = drop_in_dir / "40-xd-runtime-limits.conf"
-    temporary = drop_in_dir / ".40-xd-runtime-limits.conf.tmp"
-    content = (
-        "[Service]\n"
-        f"LimitNOFILE={PROCESS_NOFILE}\n"
-        f"LimitNPROC={PROCESS_NPROC}\n"
-        f"TasksMax={service_task_limit(unit)}\n"
-    )
-    temporary.write_text(content, encoding="ascii")
-    os.chmod(temporary, 0o644)
-    os.replace(temporary, destination)
-
-
-def apply_runtime_task_limits() -> Tuple[int, List[str]]:
-    success = 0
-    errors: List[str] = []
-    running_units = target_units()
-    units = configured_units(running_units)
-    for unit in units:
+def expand_ip_pool(raw_value):
+    addresses = []
+    seen = set()
+    for token in split_pool_tokens(raw_value):
         try:
-            write_runtime_service_drop_in(unit)
-        except OSError as exc:
-            errors.append(f"{unit} runtime drop-in: {exc}")
-
-    if units:
-        reload_result = run(["systemctl", "daemon-reload"])
-        if reload_result.returncode != 0:
-            detail = reload_result.stderr.strip() or reload_result.stdout.strip()
-            errors.append(f"systemd daemon-reload: {detail}")
-
-    for unit in running_units:
-        result = run(
-            [
-                "systemctl",
-                "set-property",
-                "--runtime",
-                unit,
-                f"TasksMax={service_task_limit(unit)}",
-            ]
-        )
-        if result.returncode == 0:
-            success += 1
-        else:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-            errors.append(f"{unit}: {detail}")
-    return success, errors
+            expanded = expand_ip_token(token, MAX_FLOAT_IPS - len(addresses))
+        except ValueError as exc:
+            print(f"[!] Ignoring invalid floating-IP pool token {token!r}: {exc}")
+            continue
+        for address in expanded:
+            if address not in seen:
+                seen.add(address)
+                addresses.append(address)
+                if len(addresses) >= MAX_FLOAT_IPS:
+                    return addresses
+    return addresses
 
 
-def physical_interfaces() -> List[str]:
-    interfaces: List[str] = []
-    net_root = Path("/sys/class/net")
+def split_subnet_definitions(raw_value):
+    return [
+        item.strip().strip("\\")
+        for item in re.split(r"[,;\n]+", str(raw_value or ""))
+        if item.strip().strip("\\")
+    ]
+
+
+def expand_subnet_definitions(raw_value):
+    addresses = []
+    seen = set()
+    for definition in split_subnet_definitions(raw_value):
+        parts = [part.strip() for part in definition.split(":")]
+        interface_raw = parts[0]
+        gateway_raw = parts[1] if len(parts) > 1 else ""
+        try:
+            interface = ipaddress.ip_interface(interface_raw)
+            if not isinstance(interface, ipaddress.IPv4Interface):
+                raise ValueError("only IPv4 subnets are supported")
+            gateway = ipaddress.ip_address(gateway_raw) if gateway_raw else None
+            if gateway is not None and not isinstance(gateway, ipaddress.IPv4Address):
+                raise ValueError("gateway is not IPv4")
+            if interface.network.num_addresses > MAX_FLOAT_IPS + 2:
+                raise ValueError("subnet is too large")
+        except ValueError as exc:
+            print(f"[!] Ignoring invalid floating subnet {definition!r}: {exc}")
+            continue
+
+        first_allowed = int(interface.ip)
+        for address in interface.network.hosts():
+            if int(address) < first_allowed or address == gateway:
+                continue
+            value = str(address)
+            if value not in seen:
+                seen.add(value)
+                addresses.append(value)
+                if len(addresses) >= MAX_FLOAT_IPS:
+                    return addresses
+    return addresses
+
+
+def fetch_managed_float_profile():
+    """Fetch this host's current floating-IP pool from the central database."""
+    host_ip = primary_source_ipv4()
+    separator = "&" if "?" in FLOAT_IP_API_URL else "?"
+    url = FLOAT_IP_API_URL + separator + urlencode({"host_ip": host_ip})
+    request = urllib.request.Request(url, headers={"User-Agent": "XD-route-ads/3"})
+
     try:
-        candidates = sorted(net_root.iterdir(), key=lambda item: item.name)
+        with urllib.request.urlopen(request, timeout=20) as response:
+            payload_raw = response.read(2 * 1024 * 1024 + 1)
+            if len(payload_raw) > 2 * 1024 * 1024:
+                raise RuntimeError("floating-IP API response is too large")
+            payload = json.loads(payload_raw.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise RuntimeError(f"floating-IP API returned HTTP {exc.code}") from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"floating-IP API request failed: {exc}") from exc
+
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise RuntimeError("floating-IP API returned an invalid payload")
+
+    try:
+        host_id = int(payload["host_id"])
+        returned_host_ip = str(ipaddress.ip_address(str(payload["host_ip"])))
+        public_interface = str(payload["public_interface"]).strip()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("floating-IP API response is missing required fields") from exc
+
+    creator = str(payload.get("creator", "")).strip().lower()
+    if host_id <= 0 or returned_host_ip != host_ip:
+        raise RuntimeError("floating-IP API returned a mismatched host")
+    if creator not in {"float", "floating", "floating_ip", "float_ip"}:
+        raise RuntimeError("floating-IP API returned a non-floating host")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", public_interface):
+        raise RuntimeError("floating-IP API returned an invalid interface")
+
+    addresses = expand_ip_pool(payload.get("ip_pool_csv", ""))
+    if not addresses:
+        addresses = expand_subnet_definitions(payload.get("subnet_definitions", ""))
+    addresses = [address for address in addresses if address != host_ip]
+    if not addresses:
+        raise RuntimeError("floating-IP database pool is empty")
+
+    return {
+        "host_id": host_id,
+        "host_ip": host_ip,
+        "public_interface": public_interface,
+        "addresses": addresses,
+        "pool_sha256": str(payload.get("pool_sha256", "")),
+    }
+
+
+def ensure_float_sync_service(profile):
+    host_id = profile["host_id"]
+    interface = profile["public_interface"]
+    addresses = sorted(set(profile["addresses"]), key=lambda value: int(ipaddress.ip_address(value)))
+    FLOAT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(FLOAT_STATE_DIR, 0o700)
+
+    sync_script = """#!/bin/sh
+set -eu
+host_id="$1"
+interface="$2"
+state="/etc/xd-dedicated-float/host-${host_id}.ips"
+test -s "$state"
+ip link show "$interface" >/dev/null
+ip link set "$interface" up
+while IFS= read -r address; do
+    test -n "$address" || continue
+    ip addr replace "${address}/32" dev "$interface"
+done < "$state"
+"""
+    script_changed = write_text_if_changed(FLOAT_SYNC_SCRIPT_PATH, sync_script, mode=0o700)
+
+    state_path = FLOAT_STATE_DIR / f"host-{host_id}.ips"
+    state_changed = write_text_if_changed(
+        state_path,
+        "".join(f"{address}\n" for address in addresses),
+        mode=0o600,
+    )
+
+    unit = f"{FLOAT_SERVICE_PREFIX}{host_id}.service"
+    unit_path = FLOAT_UNIT_DIR / unit
+    unit_content = f"""[Unit]
+Description=Direct floating IPs for dedicated host {host_id}
+After=network-online.target stunnel4.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={FLOAT_SYNC_SCRIPT_PATH} {host_id} {interface}
+
+[Install]
+WantedBy=multi-user.target
+"""
+    unit_changed = write_text_if_changed(unit_path, unit_content, mode=0o644)
+    if script_changed or unit_changed:
+        run_cmd("systemctl daemon-reload", check=True)
+    run_cmd(f"systemctl enable {shlex.quote(unit)}", check=True)
+
+    if state_changed:
+        print(
+            f"[+] Floating-IP state updated from DB: host={host_id}, "
+            f"addresses={len(addresses)}, hash={profile['pool_sha256'][:12] or 'n/a'}"
+        )
+    return state_changed
+
+
+def sync_managed_floating_ips_from_database():
+    """Sync DB state, then restore only missing addresses; never remove live IPs."""
+    try:
+        profile = fetch_managed_float_profile()
+        if profile is not None:
+            ensure_float_sync_service(profile)
+    except Exception as exc:
+        print(f"[!] Floating-IP DB sync failed; preserving cached state: {exc}")
+    return refresh_managed_floating_ips()
+
+
+def current_global_ipv4_addresses():
+    result = subprocess.run(
+        ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "could not list global IPv4 addresses")
+    return set(re.findall(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/\d+", result.stdout))
+
+
+def refresh_managed_floating_ips():
+    """Restore missing managed IPs without deleting any address from the host."""
+    states = load_managed_float_states()
+    if not states:
+        return True
+
+    try:
+        current = current_global_ipv4_addresses()
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        print(f"[!] Floating-IP check failed: {exc}")
+        return False
+
+    missing_by_host = {
+        host_id: addresses - current
+        for host_id, addresses in states.items()
+        if addresses - current
+    }
+    if not missing_by_host:
+        return True
+
+    missing_count = sum(len(addresses) for addresses in missing_by_host.values())
+    print(f"[!] Restoring {missing_count} missing managed floating IP(s).")
+    for host_id in sorted(missing_by_host, key=int):
+        unit = f"{FLOAT_SERVICE_PREFIX}{host_id}.service"
+        result = run_cmd(f"systemctl restart {shlex.quote(unit)}")
+        if result is None or result.returncode != 0:
+            print(f"[!] Could not refresh floating IPs through {unit}.")
+
+    try:
+        current = current_global_ipv4_addresses()
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        print(f"[!] Floating-IP verification failed: {exc}")
+        return False
+
+    expected = set().union(*states.values())
+    remaining = expected - current
+    if remaining:
+        print(f"[!] {len(remaining)} managed floating IP(s) are still missing.")
+        return False
+    print(f"[+] Restored all {missing_count} missing managed floating IP(s).")
+    return True
+
+
+def ensure_required_packages():
+    command_packages = {
+        "curl": "curl",
+        "dnsmasq": "dnsmasq",
+        "ipset": "ipset",
+        "iptables": "iptables",
+    }
+    missing = sorted({package for command, package in command_packages.items()
+                      if shutil.which(command) is None})
+    if not missing:
+        return
+    run_cmd("DEBIAN_FRONTEND=noninteractive apt-get update", check=True, timeout=600)
+    packages = " ".join(shlex.quote(package) for package in missing)
+    run_cmd(f"DEBIAN_FRONTEND=noninteractive apt-get install -y {packages}",
+            check=True, timeout=900)
+
+
+def valid_tun2socks_binary(path):
+    try:
+        candidate = Path(path)
+        if candidate.stat().st_size < 5 * 1024 * 1024:
+            return False
+        with candidate.open("rb") as handle:
+            return handle.read(4) == b"\x7fELF"
     except OSError:
-        return interfaces
-
-    for candidate in candidates:
-        try:
-            if not (candidate / "device").exists():
-                continue
-            if (candidate / "operstate").read_text(encoding="ascii").strip() != "up":
-                continue
-            interfaces.append(candidate.name)
-        except OSError:
-            continue
-    return interfaces
+        return False
 
 
-def tune_cpu_governor() -> Tuple[int, List[str]]:
-    """Select the performance governor where the host exposes CPU frequency control."""
-    success = 0
-    errors: List[str] = []
-    governor_paths = sorted(
-        Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor")
+def download_file(url, destination, timeout=180):
+    result = subprocess.run(
+        ["curl", "-fL", "--connect-timeout", "15", "--max-time", str(timeout),
+         "--retry", "2", "--retry-delay", "2", "-o", str(destination), url],
+        capture_output=True,
+        text=True,
+        timeout=timeout + 15,
     )
-    for governor_path in governor_paths:
-        available_path = governor_path.with_name("scaling_available_governors")
-        try:
-            available = available_path.read_text(encoding="ascii").split()
-            if available and "performance" not in available:
-                continue
-            if governor_path.read_text(encoding="ascii").strip() != "performance":
-                governor_path.write_text("performance", encoding="ascii")
-            success += 1
-        except OSError as exc:
-            errors.append(f"{governor_path}: {exc}")
-    return success, errors
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"download failed for {url}: {detail[-400:]}")
 
 
-def parse_ring_parameters(output: str) -> Dict[str, Dict[str, int]]:
-    values: Dict[str, Dict[str, int]] = {"maximum": {}, "current": {}}
-    section = ""
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        if line == "Pre-set maximums:":
-            section = "maximum"
-            continue
-        if line == "Current hardware settings:":
-            section = "current"
-            continue
-        if section not in values or ":" not in line:
-            continue
-        key, raw_value = (part.strip() for part in line.split(":", 1))
-        if key not in {"RX", "TX"} or not raw_value.isdigit():
-            continue
-        values[section][key.lower()] = int(raw_value)
-    return values
+# ---------------- Install Packages ----------------
+def setup_install_packages():
+    tun2socks_path = Path("/opt/tun2socks")
+    if valid_tun2socks_binary(tun2socks_path):
+        print("[+] Existing tun2socks binary is valid.")
+        return
 
+    architecture = platform.machine().lower()
+    asset_arch = {
+        "amd64": "amd64",
+        "x86_64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(architecture)
+    if not asset_arch:
+        raise RuntimeError(f"unsupported architecture for tun2socks: {architecture}")
 
-def cpu_mask(cpu_count: int) -> str:
-    """Return a Linux cpumask covering every online logical CPU."""
-    bits = (1 << max(1, cpu_count)) - 1
-    groups: List[str] = []
-    while bits:
-        groups.append(f"{bits & 0xFFFFFFFF:08x}")
-        bits >>= 32
-    groups[-1] = groups[-1].lstrip("0") or "0"
-    return ",".join(reversed(groups))
+    errors = []
+    with tempfile.TemporaryDirectory(prefix="tun2socks-install-") as temp_dir:
+        temp_dir = Path(temp_dir)
+        candidate = temp_dir / "tun2socks"
 
-
-def tune_receive_flow_steering(interface: str) -> Tuple[int, List[str]]:
-    """Spread 10 Gbps receive processing across otherwise idle CPUs."""
-    cpu_count = os.cpu_count() or 1
-    if cpu_count < 16:
-        return 0, []
-
-    queue_paths = sorted(Path(f"/sys/class/net/{interface}/queues").glob("rx-*"))
-    if not queue_paths:
-        return 0, []
-
-    errors: List[str] = []
-    success = 0
-    table_size = 1_048_576
-    per_queue = max(4_096, min(32_768, table_size // len(queue_paths)))
-    global_table = run(
-        ["sysctl", "-w", f"net.core.rps_sock_flow_entries={table_size}"]
-    )
-    if global_table.returncode != 0:
-        errors.append(
-            f"{interface} RFS table: "
-            f"{global_table.stderr.strip() or global_table.stdout.strip()}"
+        archive_url = (
+            "https://github.com/xjasonlyu/tun2socks/releases/latest/download/"
+            f"tun2socks-linux-{asset_arch}.zip"
         )
-        return success, errors
-
-    mask = cpu_mask(cpu_count)
-    for queue_path in queue_paths:
         try:
-            (queue_path / "rps_cpus").write_text(mask, encoding="ascii")
-            (queue_path / "rps_flow_cnt").write_text(str(per_queue), encoding="ascii")
-            success += 1
-        except OSError as exc:
-            errors.append(f"{queue_path.name} RFS: {exc}")
-    return success, errors
+            archive = temp_dir / "tun2socks.zip"
+            download_file(archive_url, archive)
+            with zipfile.ZipFile(archive) as zipped:
+                members = [name for name in zipped.namelist()
+                           if Path(name).name == f"tun2socks-linux-{asset_arch}"]
+                if not members:
+                    raise RuntimeError("tun2socks executable is missing from release archive")
+                candidate.write_bytes(zipped.read(members[0]))
+        except Exception as exc:
+            errors.append(str(exc))
 
-
-def tune_network_interfaces() -> Tuple[int, List[str]]:
-    """Apply idempotent live queue tuning without touching interface addresses."""
-    success = 0
-    errors: List[str] = []
-    ethtool = shutil.which("ethtool")
-
-    for interface in physical_interfaces():
-        qlen = run(["ip", "link", "set", "dev", interface, "txqueuelen", "10000"])
-        if qlen.returncode == 0:
-            success += 1
-        else:
-            errors.append(f"{interface} txqueuelen: {qlen.stderr.strip() or qlen.stdout.strip()}")
-
-        if not ethtool:
-            errors.append(f"{interface} ring: ethtool is not installed")
-            continue
-
-        speed = run([ethtool, interface])
-        speed_match = re.search(r"^\s*Speed:\s*(\d+)Mb/s", speed.stdout, re.MULTILINE)
-        speed_mbps = int(speed_match.group(1)) if speed.returncode == 0 and speed_match else 0
-        if speed_mbps >= 10_000:
-            rfs_success, rfs_errors = tune_receive_flow_steering(interface)
-            success += rfs_success
-            errors.extend(rfs_errors)
-
-        ring = run([ethtool, "-g", interface])
-        if ring.returncode != 0:
-            errors.append(f"{interface} ring read: {ring.stderr.strip() or ring.stdout.strip()}")
-            continue
-        parameters = parse_ring_parameters(ring.stdout)
-        maximum = parameters["maximum"]
-        current = parameters["current"]
-        requested: List[str] = []
-        for direction in ("rx", "tx"):
-            target = maximum.get(direction, 0)
-            if target > current.get(direction, 0):
-                requested.extend([direction, str(target)])
-        if requested:
-            changed = run([ethtool, "-G", interface] + requested)
-            if changed.returncode != 0:
-                errors.append(
-                    f"{interface} ring write: {changed.stderr.strip() or changed.stdout.strip()}"
-                )
-            else:
-                success += 1
-
-        if speed_mbps >= 10_000:
-            coalesce = run([ethtool, "-C", interface, "rx-usecs", "1"])
-            if coalesce.returncode == 0:
-                success += 1
-            else:
-                errors.append(
-                    f"{interface} interrupt coalescing: "
-                    f"{coalesce.stderr.strip() or coalesce.stdout.strip()}"
-                )
-
-    ip_result = run(["ip", "-o", "link", "show"])
-    if ip_result.returncode == 0:
-        tun_names = sorted(
-            set(
-                re.findall(
-                    r"^\d+:\s+((?:tun\d+|xd_tun2socks|xd_t2s\d+)):",
-                    ip_result.stdout,
-                    re.MULTILINE,
-                )
-            )
-        )
-        for interface in tun_names:
-            qlen = run(["ip", "link", "set", "dev", interface, "txqueuelen", "8192"])
-            if qlen.returncode == 0:
-                success += 1
-            else:
-                errors.append(
-                    f"{interface} txqueuelen: {qlen.stderr.strip() or qlen.stdout.strip()}"
-                )
-    else:
-        errors.append(f"tun discovery: {ip_result.stderr.strip() or ip_result.stdout.strip()}")
-
-    return success, errors
-
-
-def process_pids(names: Iterable[str]) -> List[int]:
-    found = set()
-    for name in names:
-        result = run(["pgrep", "-x", name])
-        if result.returncode not in (0, 1):
-            continue
-        for value in result.stdout.split():
+        if not valid_tun2socks_binary(candidate):
             try:
-                found.add(int(value))
-            except ValueError:
-                pass
-    return sorted(found)
+                candidate.unlink(missing_ok=True)
+                download_file(TUN2SOCKS_BINARY_URL, candidate)
+            except Exception as exc:
+                errors.append(str(exc))
+
+        if not valid_tun2socks_binary(candidate):
+            raise RuntimeError("unable to install a valid tun2socks binary: " + " | ".join(errors))
+
+        Path("/opt").mkdir(parents=True, exist_ok=True)
+        install_candidate = Path("/opt/.tun2socks.new")
+        shutil.copyfile(candidate, install_candidate)
+        os.chmod(install_candidate, 0o755)
+        os.replace(install_candidate, tun2socks_path)
+        print(f"[+] Installed tun2socks ({tun2socks_path.stat().st_size} bytes).")
 
 
-def apply_process_limits() -> Tuple[int, List[str]]:
-    if shutil.which("prlimit") is None:
-        return 0, ["prlimit command is not installed"]
+def discover_vpn_networks():
+    networks = set()
+    config_paths = [
+        path for path in (
+            "/etc/openvpn/server.conf",
+            "/etc/openvpn/server/server.conf",
+        )
+        if Path(path).is_file()
+    ]
 
-    success = 0
-    errors: List[str] = []
-    for pid in process_pids(PROCESS_NAMES):
-        result = run(
-            [
-                "prlimit",
-                "--pid",
-                str(pid),
-                f"--nofile={PROCESS_NOFILE}:{PROCESS_NOFILE}",
-                f"--nproc={PROCESS_NPROC}:{PROCESS_NPROC}",
-            ]
+    for config_path in sorted(config_paths):
+        try:
+            for raw_line in Path(config_path).read_text(errors="ignore").splitlines():
+                line = raw_line.split("#", 1)[0].split(";", 1)[0].strip()
+                match = re.match(r"^server\s+(\S+)\s+(\S+)$", line)
+                if not match:
+                    continue
+                networks.add(ipaddress.ip_network(
+                    f"{match.group(1)}/{match.group(2)}", strict=False
+                ))
+        except OSError as exc:
+            print(f"[!] Could not read {config_path}: {exc}")
+
+    active_tun_networks = []
+    try:
+        output = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout
+        for line in output.splitlines():
+            match = re.search(r"\d+:\s+(tun\d+)\s+.*?\binet\s+(\d+\.\d+\.\d+\.\d+/\d+)", line)
+            if match:
+                active_tun_networks.append((int(match.group(1)[3:]), ipaddress.ip_interface(match.group(2)).network))
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        print(f"[!] Could not inspect active OpenVPN interfaces: {exc}")
+
+    # A single-instance installation owns only the primary TUN. This fallback
+    # is used when a distro stores the server config outside the usual paths.
+    if not networks and active_tun_networks:
+        networks.add(min(active_tun_networks, key=lambda item: item[0])[1])
+
+    networks = {network for network in networks
+                if isinstance(network, ipaddress.IPv4Network)}
+    if not networks:
+        networks.add(ipaddress.ip_network(LEGACY_VPN_SUBNET))
+
+    return sorted(networks, key=lambda item: (int(item.network_address), item.prefixlen))
+
+
+def discover_vpn_subnets():
+    networks = discover_vpn_networks()
+
+    # Keep this generic for a non-default primary subnet while intentionally
+    # ignoring obsolete generated OpenVPN instances.
+    result = sorted(
+        ipaddress.collapse_addresses(networks),
+        key=lambda item: (int(item.network_address), item.prefixlen),
+    )
+    print("[+] OpenVPN subnets: " + ", ".join(str(item) for item in result))
+    return [str(item) for item in result]
+
+
+def discover_vpn_dns_routes():
+    try:
+        output = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        ).stdout
+        local_addresses = set(re.findall(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/\d+", output))
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[!] Could not inspect local DNS addresses: {exc}")
+        local_addresses = set()
+
+    routes = []
+    for network in discover_vpn_networks():
+        try:
+            gateway = str(next(network.hosts()))
+        except StopIteration:
+            continue
+        if gateway in local_addresses:
+            routes.append({"subnet": str(network), "address": gateway})
+
+    if not routes and DNS_REDIRECT_ADDRESS in local_addresses:
+        routes.append({"subnet": LEGACY_VPN_SUBNET, "address": DNS_REDIRECT_ADDRESS})
+    if not routes:
+        raise RuntimeError("no active OpenVPN DNS gateway was found")
+
+    print(
+        "[+] OpenVPN DNS workers: "
+        + ", ".join(f"{item['subnet']}->{item['address']}" for item in routes)
+    )
+    return routes
+
+
+# ---------------- ipset ----------------
+def setup_ipset():
+    # Older installations used hash:net. It accepts individual IPv4 entries too,
+    # so preserve either compatible type instead of replacing a referenced set.
+    existing = subprocess.run(
+        ["ipset", "list", IPSET_NAME],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if existing.returncode == 0 and re.search(
+        r"^Type:\s+hash:(?:ip|net)\s*$", existing.stdout, re.MULTILINE
+    ):
+        return
+
+    result = run_cmd(
+        f"ipset create {shlex.quote(IPSET_NAME)} hash:ip "
+        "family inet hashsize 4096 maxelem 1048576 -exist",
+    )
+    if result is not None and result.returncode == 0:
+        return
+
+    existing = subprocess.run(
+        ["ipset", "list", IPSET_NAME],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if existing.returncode == 0 and re.search(
+        r"^Type:\s+hash:(?:ip|net)\s*$", existing.stdout, re.MULTILINE
+    ):
+        print("[!] Reusing the proxylist ipset created by another process.")
+        return
+    raise RuntimeError(f"unable to create or reuse the {IPSET_NAME} ipset")
+
+
+def refresh_proxy_ipset():
+    resolved_ips = set()
+    try:
+        lookup = subprocess.run(
+            ["getent", "ahostsv4", *IPSET_PREWARM_DOMAINS],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[!] Proxy ipset prewarm lookup failed: {exc}")
+        return
+
+    for line in lookup.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        try:
+            address = ipaddress.ip_address(fields[0])
+        except ValueError:
+            continue
+        if isinstance(address, ipaddress.IPv4Address):
+            resolved_ips.add(str(address))
+
+    added = 0
+    for address in sorted(resolved_ips):
+        result = subprocess.run(
+            ["ipset", "add", IPSET_NAME, address, "-exist"],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0:
-            success += 1
-        else:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-            errors.append(f"pid {pid}: {detail}")
-    return success, errors
+            added += 1
 
-
-def apply_own_limits() -> List[str]:
-    errors: List[str] = []
-    requested = (
-        (resource.RLIMIT_NOFILE, PROCESS_NOFILE, "RLIMIT_NOFILE"),
-        (resource.RLIMIT_NPROC, PROCESS_NPROC, "RLIMIT_NPROC"),
+    print(
+        f"[+] Proxy ipset prewarm: {added} IPv4 addresses for "
+        f"{len(IPSET_PREWARM_DOMAINS)} configured domains"
     )
-    for limit, value, name in requested:
+
+
+# ---------------- dnsmasq ----------------
+# DNS_TCP_CAPACITY_V1: budget is shared across every DNS worker on the host.
+DNS_TCP_RAM_DIVISOR = 4
+DNS_TCP_CHILD_BUDGET_BYTES = 2 * 1024 * 1024
+DNS_TCP_MAX_PER_WORKER = 2048
+
+
+def dns_tcp_capacity(worker_count, memory_bytes=None):
+    if memory_bytes is None:
+        memory_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        # Respect a container memory ceiling when one exists.
+        for limit_path in ("/sys/fs/cgroup/memory.max",
+                           "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+            try:
+                limit = int(Path(limit_path).read_text().strip())
+                if limit > 0:
+                    memory_bytes = min(memory_bytes, limit)
+            except (OSError, ValueError):
+                pass
+    workers = max(1, int(worker_count))
+    slots = int(memory_bytes) // DNS_TCP_RAM_DIVISOR // workers // DNS_TCP_CHILD_BUDGET_BYTES
+    if slots < 1:
+        raise ValueError("Insufficient RAM budget for the number of DNS workers")
+    return min(DNS_TCP_MAX_PER_WORKER, 1 << (slots.bit_length() - 1))
+
+
+def dns_worker_token(address):
+    return address.replace(".", "-")
+
+
+def dns_worker_unit(address):
+    return f"{DNS_WORKER_PREFIX}{dns_worker_token(address)}.service"
+
+
+def dns_primary_address(dns_routes):
+    addresses = [item["address"] for item in dns_routes]
+    if DNS_REDIRECT_ADDRESS in addresses:
+        return DNS_REDIRECT_ADDRESS
+    return addresses[0]
+
+
+def dns_worker_config(address, tcp_limit):
+    token = dns_worker_token(address)
+    return f"""port=53
+listen-address={address}
+bind-interfaces
+user=dnsmasq
+pid-file=/run/{DNS_WORKER_PREFIX}{token}.pid
+no-resolv
+server=1.1.1.1
+server=1.0.0.1
+server=8.8.8.8
+server=8.8.4.4
+cache-size={DNS_CACHE_SIZE}
+dns-forward-max={DNS_FORWARD_MAX}
+max-tcp-connections={tcp_limit}
+conf-file=/etc/dnsmasq.d/ipset.conf
+"""
+
+
+def dns_worker_service(address, config_path):
+    return f"""[Unit]
+Description=XD dnsmasq worker for {address}
+Wants=network-online.target
+After=network-online.target dnsmasq.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file={config_path}
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def cleanup_stale_dns_workers(active_addresses):
+    active_tokens = {dns_worker_token(address) for address in active_addresses}
+    changed = False
+    for unit_path in Path("/etc/systemd/system").glob(f"{DNS_WORKER_PREFIX}*.service"):
+        token = unit_path.name[len(DNS_WORKER_PREFIX):-len(".service")]
+        if token in active_tokens:
+            continue
+        run_cmd(f"systemctl disable --now {shlex.quote(unit_path.name)}")
         try:
-            _soft, hard = resource.getrlimit(limit)
-            effective = value if hard == resource.RLIM_INFINITY else min(value, hard)
-            resource.setrlimit(limit, (effective, hard))
-        except (OSError, ValueError) as exc:
-            errors.append(f"{name}: {exc}")
-    return errors
+            unit_path.unlink()
+            changed = True
+        except OSError:
+            pass
+        config_path = DNS_WORKER_CONFIG_DIR / f"{token}.conf"
+        try:
+            config_path.unlink()
+        except OSError:
+            pass
+    if changed:
+        run_cmd("systemctl daemon-reload", check=True)
 
 
-def sysctl_value(key: str) -> str:
-    result = run(["sysctl", "-n", key])
+def setup_dnsmasq(dns_routes):
+    tcp_limit = dns_tcp_capacity(len(dns_routes))
+    primary_address = dns_primary_address(dns_routes)
+    dnsmasq_main = f"""port=53
+listen-address=127.0.0.1,{primary_address}
+bind-dynamic
+conf-dir=/etc/dnsmasq.d/,*.conf
+no-resolv
+cache-size={DNS_CACHE_SIZE}
+dns-forward-max={DNS_FORWARD_MAX}
+max-tcp-connections={tcp_limit}
+"""
+    ipset_config = "".join(
+        f"ipset=/{domain}/{IPSET_NAME}\n" for domain in DOMAINS
+    )
+    dns_openvpn = """server=1.1.1.1
+server=1.0.0.1
+server=8.8.8.8
+server=8.8.4.4
+"""
+
+    changed = write_text_if_changed("/etc/dnsmasq.conf", dnsmasq_main)
+    changed = write_text_if_changed("/etc/dnsmasq.d/ipset.conf", ipset_config) or changed
+    changed = write_text_if_changed("/etc/dnsmasq.d/openvpn_dns.conf", dns_openvpn) or changed
+    run_cmd("dnsmasq --test", check=True)
+    run_cmd("systemctl enable dnsmasq", check=True)
+    if changed or not service_is_active("dnsmasq.service"):
+        run_cmd("systemctl restart dnsmasq", check=True)
+
+    DNS_WORKER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(DNS_WORKER_CONFIG_DIR, 0o755)
+    worker_addresses = [
+        item["address"] for item in dns_routes if item["address"] != primary_address
+    ]
+    cleanup_stale_dns_workers(worker_addresses)
+
+    daemon_reload = False
+    changed_units = set()
+    for address in worker_addresses:
+        token = dns_worker_token(address)
+        config_path = DNS_WORKER_CONFIG_DIR / f"{token}.conf"
+        unit = dns_worker_unit(address)
+        unit_path = Path("/etc/systemd/system") / unit
+        config_changed = write_text_if_changed(
+            config_path, dns_worker_config(address, tcp_limit), mode=0o644
+        )
+        unit_changed = write_text_if_changed(
+            unit_path, dns_worker_service(address, config_path), mode=0o644
+        )
+        run_cmd(f"dnsmasq --test --conf-file={shlex.quote(str(config_path))}", check=True)
+        if unit_changed:
+            daemon_reload = True
+        if config_changed or unit_changed:
+            changed_units.add(unit)
+
+    if daemon_reload:
+        run_cmd("systemctl daemon-reload", check=True)
+    for address in worker_addresses:
+        unit = dns_worker_unit(address)
+        run_cmd(f"systemctl enable {shlex.quote(unit)}", check=True)
+        action = "restart" if unit in changed_units else "start"
+        run_cmd(f"systemctl {action} {shlex.quote(unit)}", check=True)
+
+    if not dns_workers_are_ready(dns_routes):
+        raise RuntimeError("one or more OpenVPN DNS workers failed to start")
+    print(
+        f"[+] DNS load is distributed across {len(dns_routes)} "
+        f"OpenVPN gateway(s); primary={primary_address}"
+    )
+    return primary_address
+
+
+# ---------------- tun2socks interfaces ----------------
+def lane_device(slot):
+    return f"{MULTI_TUN_PREFIX}{slot:02d}"
+
+
+def lane_address(slot):
+    address = MULTI_TUN_NETWORK.network_address + (slot * 4) + 1
+    return f"{address}/30"
+
+
+def lane_gateway(slot):
+    return lane_address(slot).split("/", 1)[0]
+
+
+def lane_unit(slot):
+    return f"{MULTI_UNIT_PREFIX}{slot:02d}.service"
+
+
+def setup_tun2socks_interface(lane):
+    device = lane["device"]
+    address = lane["address"]
+    run_cmd(
+        f"ip link show {shlex.quote(device)} >/dev/null 2>&1 || "
+        f"ip tuntap add dev {shlex.quote(device)} mode tun",
+        check=True,
+    )
+    run_cmd(
+        f"ip addr replace {shlex.quote(address)} dev {shlex.quote(device)}",
+        check=True,
+    )
+    run_cmd(
+        f"ip link set dev {shlex.quote(device)} mtu 1500 txqueuelen 8192 up",
+        check=True,
+    )
+    run_cmd(
+        f"sysctl -w net.ipv4.conf.{shlex.quote(device)}.rp_filter=0",
+        check=True,
+    )
+
+
+# ---------------- iptables ----------------
+def iptables_call(table, arguments, check=False):
+    command = ["iptables", "-w", "10"]
+    if table != "filter":
+        command.extend(["-t", table])
+    command.extend(arguments)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"iptables command failed: {' '.join(command)}: {result.stderr.strip()}"
+        )
+    return result
+
+
+def ensure_chain(table, chain):
+    result = iptables_call(table, ["-N", chain])
+    if result.returncode not in (0, 1):
+        raise RuntimeError(result.stderr.strip())
+    iptables_call(table, ["-F", chain], check=True)
+
+
+def ensure_jump(table, parent, child):
+    rule = ["-j", child]
+    if iptables_call(table, ["-C", parent] + rule).returncode != 0:
+        iptables_call(table, ["-I", parent, "1"] + rule, check=True)
+
+
+def remove_rule_all(table, chain, rule):
+    while iptables_call(table, ["-C", chain] + rule).returncode == 0:
+        iptables_call(table, ["-D", chain] + rule, check=True)
+
+
+def remove_legacy_rules():
+    legacy_mark = [
+        "-s", LEGACY_VPN_SUBNET,
+        "-m", "set", "--match-set", IPSET_NAME, "dst",
+        "-j", "MARK", "--set-mark", "1",
+    ]
+    legacy_mark_ports = [
+        "-s", LEGACY_VPN_SUBNET, "-p", "tcp",
+        "-m", "multiport", "--dports", "80,443,8080,8443",
+        "-m", "set", "--match-set", IPSET_NAME, "dst",
+        "-j", "MARK", "--set-mark", "1",
+    ]
+    legacy_udp = [
+        "-s", LEGACY_VPN_SUBNET, "-p", "udp",
+        "-m", "mark", "--mark", "1", "-j", "DROP",
+    ]
+    for rule in (legacy_mark, legacy_mark_ports, legacy_udp):
+        remove_rule_all("mangle", "PREROUTING", rule)
+
+    remove_rule_all("mangle", "PREROUTING", ["-j", "TUN2SOCKS"])
+
+
+def setup_vpn_forwarding(vpn_subnets, dns_routes):
+    ensure_chain("filter", FORWARD_CHAIN)
+    ensure_jump("filter", "FORWARD", FORWARD_CHAIN)
+    ensure_chain("nat", NAT_CHAIN)
+    ensure_jump("nat", "POSTROUTING", NAT_CHAIN)
+
+    if ENFORCE_VPN_DNS:
+        ensure_chain("nat", DNS_NAT_CHAIN)
+        ensure_jump("nat", "PREROUTING", DNS_NAT_CHAIN)
+        ensure_chain("filter", DNS_INPUT_CHAIN)
+        ensure_jump("filter", "INPUT", DNS_INPUT_CHAIN)
+
+    if ENFORCE_VPN_DNS:
+        for route in dns_routes:
+            subnet = route["subnet"]
+            address = route["address"]
+            for protocol in ("udp", "tcp"):
+                iptables_call("nat", [
+                    "-A", DNS_NAT_CHAIN, "-s", subnet,
+                    "-p", protocol, "--dport", "53",
+                    "-j", "DNAT", "--to-destination", f"{address}:53",
+                ], check=True)
+                iptables_call("filter", [
+                    "-A", DNS_INPUT_CHAIN, "-s", subnet, "-d", address,
+                    "-p", protocol, "--dport", "53", "-j", "ACCEPT",
+                ], check=True)
+
+    for subnet in vpn_subnets:
+
+        if BLOCK_DNS_OVER_TLS:
+            iptables_call("filter", [
+                "-A", FORWARD_CHAIN, "-s", subnet,
+                "-p", "tcp", "--dport", "853",
+                "-j", "REJECT", "--reject-with", "tcp-reset",
+            ], check=True)
+            iptables_call("filter", [
+                "-A", FORWARD_CHAIN, "-s", subnet,
+                "-p", "udp", "--dport", "853",
+                "-j", "REJECT", "--reject-with", "icmp-port-unreachable",
+            ], check=True)
+
+        # Keep the legacy interface accepted as a rollback path while the
+        # multipath route is switched atomically by `ip route replace`.
+        for output_interface in (f"{MULTI_TUN_PREFIX}+", TUN_DEV):
+            iptables_call("filter", [
+                "-A", FORWARD_CHAIN, "-s", subnet,
+                "-o", output_interface, "-j", "ACCEPT"
+            ], check=True)
+            iptables_call("filter", [
+                "-A", FORWARD_CHAIN, "-d", subnet,
+                "-i", output_interface,
+                "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"
+            ], check=True)
+            iptables_call("nat", [
+                "-A", NAT_CHAIN, "-s", subnet,
+                "-o", output_interface, "-j", "MASQUERADE"
+            ], check=True)
+
+
+def setup_iptables_fwmark(vpn_subnets):
+    remove_legacy_rules()
+    ensure_chain("mangle", MARK_CHAIN)
+    ensure_jump("mangle", "PREROUTING", MARK_CHAIN)
+
+    for subnet in vpn_subnets:
+        if ENFORCE_VPN_DNS:
+            # DNS is redirected to the local dnsmasq in nat/PREROUTING. It
+            # must not inherit a proxy mark (or the UDP guard would drop it)
+            # before DNAT gets a chance to run.
+            for protocol in ("udp", "tcp"):
+                iptables_call("mangle", [
+                    "-A", MARK_CHAIN, "-s", subnet,
+                    "-p", protocol, "--dport", "53", "-j", "RETURN",
+                ], check=True)
+
+        mark_rule = ["-A", MARK_CHAIN, "-s", subnet]
+        if not FULL_ROUTE_TO_PROXY:
+            mark_rule.extend([
+                "-p", "tcp", "-m", "multiport",
+                "--dports", "80,443,8080,8443",
+            ])
+        mark_rule.extend([
+            "-m", "set", "--match-set", IPSET_NAME, "dst",
+            "-j", "MARK", "--set-xmark", "0x1/0x1",
+        ])
+        iptables_call("mangle", mark_rule, check=True)
+
+        if block_udp:
+            iptables_call("mangle", [
+                "-A", MARK_CHAIN, "-s", subnet, "-p", "udp",
+                "-m", "mark", "--mark", "0x1/0x1", "-j", "DROP",
+            ], check=True)
+
+
+def setup_iptables_dnstt(DNSTT_PORT):
+    import subprocess
+    import shutil
+    import os
+    import sys
+
+    def run(cmd):
+        return subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+    # iptables exists?
+    if not shutil.which("iptables"):
+        sys.exit(1)
+
+    # detect interface
+    interface = None
+    try:
+        interface = subprocess.check_output(
+            "ip route | grep default | awk '{print $5}' | head -1",
+            shell=True,
+            text=True
+        ).strip()
+    except:
+        pass
+
+    if not interface:
+        try:
+            interface = subprocess.check_output(
+                r"ip link show | grep -E '^[0-9]+: (eth|ens|enp)' | head -1 | cut -d':' -f2 | awk '{print $1}'",
+                shell=True,
+                text=True
+            ).strip()
+        except:
+            pass
+
+    if not interface:
+        interface = "eth0"
+
+    # IPv4
+    if not run(f"iptables -I INPUT -p udp --dport {DNSTT_PORT} -j ACCEPT"):
+        sys.exit(1)
+
+    if not run(
+            f"iptables -t nat -I PREROUTING -i {interface} -p udp --dport 53 "
+            f"-j REDIRECT --to-ports {DNSTT_PORT}"
+    ):
+        sys.exit(1)
+
+    # IPv6 (best-effort)
+    if shutil.which("ip6tables") and os.path.exists("/proc/net/if_inet6"):
+        run(f"ip6tables -I INPUT -p udp --dport {DNSTT_PORT} -j ACCEPT")
+        run(
+            f"ip6tables -t nat -I PREROUTING -i {interface} -p udp --dport 53 "
+            f"-j REDIRECT --to-ports {DNSTT_PORT}"
+        )
+
+
+def setup_tun2socks_routing(lanes):
+    if not lanes:
+        raise RuntimeError("refusing to install an empty tun2socks route")
+
+    rt_tables_path = Path("/etc/iproute2/rt_tables")
+    rt_tables = rt_tables_path.read_text(errors="ignore")
+    if not re.search(rf"^\s*{re.escape(PROXY_TABLE)}\s+tun2socks\s*$", rt_tables, re.MULTILINE):
+        with rt_tables_path.open("a") as handle:
+            handle.write(f"\n{PROXY_TABLE} tun2socks\n")
+
+    rules = subprocess.run(
+        ["ip", "rule", "show"], check=True, capture_output=True, text=True, timeout=15
+    ).stdout
+    if not any("fwmark 0x1" in line and ("lookup tun2socks" in line or "lookup 100" in line)
+               for line in rules.splitlines()):
+        run_cmd("ip rule add priority 100 fwmark 0x1/0x1 table tun2socks", check=True)
+
+    # L4 hashing keeps every TCP connection on one proxy while distributing
+    # different connections across all active lanes.
+    run_cmd("sysctl -w net.ipv4.fib_multipath_hash_policy=1", check=True)
+    command = [
+        "ip", "route", "replace", "default", "table", PROXY_TABLE,
+        "scope", "global",
+    ]
+    for lane in sorted(lanes, key=lambda item: item["slot"]):
+        command.extend([
+            "nexthop", "dev", lane["device"],
+            "weight", str(max(1, int(lane.get("weight", 1)))),
+        ])
+    result = subprocess.run(
+        command, capture_output=True, text=True, timeout=30,
+    )
     if result.returncode != 0:
-        return "unavailable"
-    return result.stdout.strip()
+        raise RuntimeError(f"multipath route failed: {result.stderr.strip()}")
+    print(f"[+] Active proxy route lanes: {len(lanes)}")
 
 
-def task_limit(unit: str) -> str:
-    result = run(["systemctl", "show", unit, "--property=TasksMax", "--value"])
-    if result.returncode != 0:
-        return "unavailable"
-    return result.stdout.strip()
+# ---------------- systemd tun2socks ----------------
+def clean_proxy_url(raw_url: str) -> str:
+    url = raw_url.strip().replace('\ufeff', '')
+    url = re.sub(r'\s+', '', url)
+    if not url.startswith("socks5://") and not url.startswith("http://") and not url.startswith("https://"):
+        url = "socks5://" + url
+    url = url.rstrip('/')
+    try:
+        parsed = urlsplit(url)
+        valid = (
+            parsed.scheme in {"socks5", "http", "https"}
+            and bool(parsed.hostname)
+            and parsed.port is not None
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("proxy API returned an invalid proxy URL")
+    return url
 
 
-def apply_limits() -> int:
-    require_root()
-    log(
-        f"profile={PROFILE.name} memory={PROFILE.memory_bytes / GIB:.1f}GiB "
-        f"scale={PROFILE.scale:.2f}x-from-{BASELINE_MEMORY_GIB}GiB "
-        f"conntrack={CONNTRACK_MAX} tasks={SERVICE_TASKS_MAX} "
-        f"nofile={PROCESS_NOFILE}"
+def current_service_proxy():
+    service_path = Path("/etc/systemd/system/tun2socks.service")
+    if not service_path.exists():
+        return None
+    match = re.search(
+        r"^ExecStart=.*?\s--?proxy\s+(\S+)",
+        service_path.read_text(errors="ignore"),
+        re.MULTILINE,
     )
-    log("loading nf_conntrack")
-    conntrack_loaded, conntrack_detail = load_conntrack()
+    if not match:
+        return None
+    try:
+        # A literal percent sign is escaped as %% inside a systemd unit.
+        return clean_proxy_url(match.group(1).strip("\"'").replace("%%", "%"))
+    except ValueError:
+        return None
 
-    if conntrack_loaded:
-        conntrack_ok, conntrack_detail = apply_conntrack_capacity()
-    else:
-        conntrack_ok = False
-    sysctl_ok, sysctl_errors = apply_sysctls()
-    service_ok, service_errors = apply_runtime_task_limits()
-    process_ok, process_errors = apply_process_limits()
-    cpu_ok, cpu_errors = tune_cpu_governor()
-    network_ok, network_errors = tune_network_interfaces()
-    own_errors = apply_own_limits()
 
-    errors = (
-        sysctl_errors
-        + service_errors
-        + process_errors
-        + cpu_errors
-        + network_errors
-        + own_errors
+def fetch_proxy_url():
+    try:
+        request = urllib.request.Request(PROXY_API_URL, headers={"User-Agent": "XD-route-ads/2"})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 200:
+                raise RuntimeError(f"proxy API returned HTTP {response.status}")
+            return clean_proxy_url(response.read(4096).decode("utf-8", errors="replace"))
+    except Exception as exc:
+        existing = current_service_proxy()
+        if existing:
+            print(f"[!] Proxy fetch failed; preserving current service proxy: {exc}")
+            return existing
+        raise RuntimeError(f"proxy fetch failed and no previous proxy is available: {exc}") from exc
+
+
+def redact_proxy(proxy_url):
+    return re.sub(r"(?<=//)[^/@]+@", "***@", proxy_url)
+
+
+def proxy_record_key(record):
+    digest = hashlib.sha256(record["proxy"].encode("utf-8")).hexdigest()[:12]
+    return f"{record.get('id', 0)}-{digest}"
+
+
+def normalize_proxy_records(records):
+    normalized = []
+    seen = set()
+    for position, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        try:
+            proxy_url = clean_proxy_url(str(record.get("proxy", "")))
+        except ValueError:
+            continue
+        if proxy_url in seen:
+            continue
+        seen.add(proxy_url)
+        try:
+            record_id = int(record.get("id", position + 1))
+        except (TypeError, ValueError):
+            record_id = position + 1
+        country = re.sub(r"[^a-z]", "", str(record.get("country", "")).lower())[:2]
+        item = {"id": record_id, "country": country, "proxy": proxy_url}
+        item["key"] = proxy_record_key(item)
+        normalized.append(item)
+    return normalized
+
+
+def load_cached_proxy_records():
+    try:
+        payload = json.loads(MULTI_PROXY_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+    records = payload.get("proxies", []) if isinstance(payload, dict) else []
+    return normalize_proxy_records(records)
+
+
+def fetch_proxy_records():
+    separator = "&" if "?" in PROXY_API_URL else "?"
+    url = PROXY_API_URL + separator + "format=json"
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "XD-route-ads/3"})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 200:
+                raise RuntimeError(f"proxy API returned HTTP {response.status}")
+            raw_payload = response.read(1024 * 1024).decode("utf-8", errors="replace")
+        payload = json.loads(raw_payload)
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise RuntimeError("proxy API returned an unsuccessful payload")
+        records = normalize_proxy_records(payload.get("proxies", []))
+        if not records:
+            raise RuntimeError("proxy API returned no valid proxies")
+        MULTI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(MULTI_STATE_DIR, 0o700)
+        cache_payload = json.dumps(
+            {"version": 1, "proxies": records}, sort_keys=True, separators=(",", ":")
+        ) + "\n"
+        write_text_if_changed(MULTI_PROXY_CACHE_PATH, cache_payload, mode=0o600)
+        return records
+    except Exception as exc:
+        cached = load_cached_proxy_records()
+        if cached:
+            print(f"[!] Proxy-list fetch failed; preserving {len(cached)} cached lanes: {exc}")
+            return cached
+        legacy = fetch_proxy_url()
+        records = normalize_proxy_records([{"id": 0, "country": "", "proxy": legacy}])
+        print(f"[!] Multi-proxy API unavailable; using the legacy proxy: {exc}")
+        return records
+
+
+def proxy_lane_limit(proxy_count):
+    override_raw = os.environ.get("XD_TUN2SOCKS_MAX_LANES", "").strip()
+    if override_raw:
+        try:
+            override = int(override_raw)
+        except ValueError:
+            override = 0
+        if override > 0:
+            return min(proxy_count, MAX_PROXY_LANES, override)
+    return min(proxy_count, MAX_PROXY_LANES)
+
+
+def select_proxy_records(records):
+    limit = proxy_lane_limit(len(records))
+    return records[:limit]
+
+
+def load_slot_map():
+    try:
+        payload = json.loads(MULTI_SLOT_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result = {}
+    used = set()
+    for key, raw_slot in payload.items():
+        try:
+            slot = int(raw_slot)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= slot < MAX_PROXY_LANES and slot not in used:
+            result[str(key)] = slot
+            used.add(slot)
+    return result
+
+
+def assign_lane_slots(records):
+    previous = load_slot_map()
+    active_keys = {record["key"] for record in records}
+    mapping = {key: slot for key, slot in previous.items() if key in active_keys}
+    used = set(mapping.values())
+    for record in records:
+        if record["key"] in mapping:
+            continue
+        for slot in range(MAX_PROXY_LANES):
+            if slot not in used:
+                mapping[record["key"]] = slot
+                used.add(slot)
+                break
+        else:
+            raise RuntimeError("no free tun2socks lane slot")
+
+    MULTI_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(MULTI_STATE_DIR, 0o700)
+    write_text_if_changed(
+        MULTI_SLOT_PATH,
+        json.dumps(mapping, sort_keys=True, separators=(",", ":")) + "\n",
+        mode=0o600,
     )
-    if not conntrack_ok:
-        errors.insert(0, f"nf_conntrack: {conntrack_detail}")
-    log(
-        "applied "
-        f"sysctl={sysctl_ok}/{len(SYSCTLS)} "
-        f"services={service_ok} processes={process_ok} cpu={cpu_ok} "
-        f"network={network_ok} "
-        f"conntrack={'ok' if conntrack_ok else 'warning'} ({conntrack_detail})"
-    )
-    log(
-        "runtime "
-        f"conntrack={sysctl_value('net.netfilter.nf_conntrack_count')}/"
-        f"{sysctl_value('net.netfilter.nf_conntrack_max')} "
-        f"stunnel_pool_tasks_max={task_limit('xd-stunnel-pool@0.service')}"
-    )
-
-    for error in errors:
-        log(f"WARN {error}")
-    if errors:
-        log(f"completed with {len(errors)} warning(s)")
-        return 1
-
-    log("all live limits were applied successfully")
-    return 0
+    return mapping
 
 
-def refresh_live_tuning() -> None:
-    """Recover settings that can be reset by a process or interface restart."""
-    process_ok, process_errors = apply_process_limits()
-    cpu_ok, cpu_errors = tune_cpu_governor()
-    network_ok, network_errors = tune_network_interfaces()
-    errors = process_errors + cpu_errors + network_errors
-    if errors:
-        for error in errors:
-            log(f"REFRESH WARN {error}")
-        return
-    log(
-        f"refreshed processes={process_ok} cpu={cpu_ok} network={network_ok}"
-    )
+def build_lanes(records):
+    selected = select_proxy_records(records)
+    mapping = assign_lane_slots(selected)
+    lanes = []
+    for record in selected:
+        slot = mapping[record["key"]]
+        lane = dict(record)
+        lane.update({
+            "slot": slot,
+            "device": lane_device(slot),
+            "address": lane_address(slot),
+            "gateway": lane_gateway(slot),
+            "unit": lane_unit(slot),
+            "weight": 1,
+        })
+        lanes.append(lane)
+    return sorted(lanes, key=lambda item: item["slot"])
 
 
-def request_stop(signum: int, _frame: object) -> None:
-    global STOP_REQUESTED
-    STOP_REQUESTED = True
-    log(f"received signal {signum}; stopping")
+def lane_gomaxprocs(lane_count):
+    cpus = max(1, os.cpu_count() or 1)
+    return max(1, min(4, cpus // max(1, lane_count)))
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="apply limits and exit instead of staying idle for PM2",
-    )
-    parser.add_argument(
-        "--refresh-seconds",
-        type=int,
-        default=DEFAULT_REFRESH_SECONDS,
-        help=(
-            "refresh live process/NIC/TUN settings at this interval under PM2; "
-            "use 0 to disable (default: 300)"
-        ),
-    )
-    return parser.parse_args()
+def lane_service_content(lane, lane_count):
+    systemd_proxy = lane["proxy"].replace("%", "%%")
+    label = lane["country"] or "proxy"
+    return f"""[Unit]
+Description=XD tun2socks lane {lane['slot']:02d} ({label})
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=GOMAXPROCS={lane_gomaxprocs(lane_count)}
+ExecStartPre=/bin/bash -c 'ip link show {lane['device']} >/dev/null 2>&1 || ip tuntap add dev {lane['device']} mode tun'
+ExecStartPre=/sbin/ip addr replace {lane['address']} dev {lane['device']}
+ExecStartPre=/sbin/ip link set dev {lane['device']} mtu 1500 txqueuelen 8192 up
+ExecStart=/opt/tun2socks --device {lane['device']} --proxy {systemd_proxy} --loglevel error
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+TasksMax=infinity
+TimeoutStopSec=5s
+KillMode=mixed
+SendSIGKILL=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
 
 
-def main() -> int:
-    args = parse_args()
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
+def prepare_proxy_lanes(records):
+    lanes = build_lanes(records)
+    changed_units = set()
+    for lane in lanes:
+        setup_tun2socks_interface(lane)
+        unit_path = Path("/etc/systemd/system") / lane["unit"]
+        if write_text_if_changed(
+            unit_path, lane_service_content(lane, len(lanes)), mode=0o600
+        ):
+            changed_units.add(lane["unit"])
 
-    result = apply_limits()
-    if args.once:
-        return result
+    if changed_units:
+        run_cmd("systemctl daemon-reload", check=True)
+    for lane in lanes:
+        run_cmd(f"systemctl enable {shlex.quote(lane['unit'])}", check=True)
+        action = "restart" if lane["unit"] in changed_units else "start"
+        run_cmd(f"systemctl {action} {shlex.quote(lane['unit'])}", check=True)
 
-    if result != 0:
-        log("one or more settings failed; staying idle to avoid a PM2 restart loop")
-    if args.refresh_seconds < 0 or 0 < args.refresh_seconds < 30:
-        raise SystemExit("--refresh-seconds must be 0 or at least 30")
-    if args.refresh_seconds == 0:
-        log("idle under PM2; live refresh is disabled")
-    else:
-        log(f"idle under PM2; refreshing live tuning every {args.refresh_seconds}s")
-    next_refresh = time.monotonic() + args.refresh_seconds
-    while not STOP_REQUESTED:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if all(service_is_active(lane["unit"]) for lane in lanes):
+            break
         time.sleep(1)
-        if args.refresh_seconds and time.monotonic() >= next_refresh:
-            refresh_live_tuning()
-            next_refresh = time.monotonic() + args.refresh_seconds
-    return 0
+    active = [lane for lane in lanes if service_is_active(lane["unit"])]
+    if not active:
+        raise RuntimeError("none of the tun2socks lanes started")
+    if len(active) != len(lanes):
+        print(f"[!] Only {len(active)}/{len(lanes)} tun2socks lanes started")
+    return lanes, active
+
+
+def cleanup_stale_lanes(active_slots):
+    active_slots = {int(slot) for slot in active_slots}
+    for unit_path in Path("/etc/systemd/system").glob(f"{MULTI_UNIT_PREFIX}*.service"):
+        match = re.fullmatch(rf"{re.escape(MULTI_UNIT_PREFIX)}(\d+)\.service", unit_path.name)
+        if not match:
+            continue
+        slot = int(match.group(1))
+        if slot in active_slots:
+            continue
+        run_cmd(f"systemctl disable --now {shlex.quote(unit_path.name)}")
+        try:
+            unit_path.unlink()
+        except OSError:
+            pass
+        run_cmd(f"ip link delete {shlex.quote(lane_device(slot))} 2>/dev/null || true")
+
+
+def activate_multi_lane_mode(route_lanes, configured_lanes=None):
+    configured_lanes = configured_lanes or route_lanes
+    setup_tun2socks_routing(route_lanes)
+    write_text_if_changed(
+        MULTI_MARKER_PATH,
+        json.dumps({
+            "enabled": True,
+            "configured_lanes": len(configured_lanes),
+            "route_lanes": len(route_lanes),
+        }, sort_keys=True) + "\n",
+        mode=0o600,
+    )
+    run_cmd("systemctl disable --now tun2socks.service 2>/dev/null || true")
+    run_cmd("systemctl reset-failed tun2socks.service 2>/dev/null || true")
+    run_cmd(f"ip link delete {shlex.quote(TUN_DEV)} 2>/dev/null || true")
+    cleanup_stale_lanes({lane["slot"] for lane in configured_lanes})
+
+
+def prepare_dnsmasq_install():
+    run_cmd("systemctl disable --now systemd-resolved 2>/dev/null || true")
+    try:
+        Path("/etc/resolv.conf").unlink(missing_ok=True)
+    except OSError:
+        pass
+    write_text_if_changed(
+        "/etc/resolv.conf", "nameserver 1.1.1.1\nnameserver 1.0.0.1\nnameserver 8.8.8.8\nnameserver 8.8.4.4\n"
+    )
+
+
+def use_local_dnsmasq(address=DNS_REDIRECT_ADDRESS):
+    run_cmd("systemctl disable --now systemd-resolved 2>/dev/null || true")
+    try:
+        Path("/etc/resolv.conf").unlink(missing_ok=True)
+    except OSError:
+        pass
+    write_text_if_changed("/etc/resolv.conf", f"nameserver {address}\n")
+
+
+def firewall_rules_present(vpn_subnets, dns_routes):
+    if iptables_call("mangle", ["-C", "PREROUTING", "-j", MARK_CHAIN]).returncode != 0:
+        return False
+    if iptables_call("filter", ["-C", "FORWARD", "-j", FORWARD_CHAIN]).returncode != 0:
+        return False
+    if iptables_call("nat", ["-C", "POSTROUTING", "-j", NAT_CHAIN]).returncode != 0:
+        return False
+    if ENFORCE_VPN_DNS:
+        if iptables_call("nat", ["-C", "PREROUTING", "-j", DNS_NAT_CHAIN]).returncode != 0:
+            return False
+        if iptables_call("filter", ["-C", "INPUT", "-j", DNS_INPUT_CHAIN]).returncode != 0:
+            return False
+        for route in dns_routes:
+            subnet = route["subnet"]
+            address = route["address"]
+            for protocol in ("udp", "tcp"):
+                dns_redirect = [
+                    "-s", subnet, "-p", protocol, "--dport", "53",
+                    "-j", "DNAT", "--to-destination", f"{address}:53",
+                ]
+                dns_accept = [
+                    "-s", subnet, "-d", address,
+                    "-p", protocol, "--dport", "53", "-j", "ACCEPT",
+                ]
+                if any((
+                    iptables_call("nat", ["-C", DNS_NAT_CHAIN] + dns_redirect).returncode != 0,
+                    iptables_call("filter", ["-C", DNS_INPUT_CHAIN] + dns_accept).returncode != 0,
+                )):
+                    return False
+    for subnet in vpn_subnets:
+        if ENFORCE_VPN_DNS:
+            for protocol in ("udp", "tcp"):
+                dns_return = [
+                    "-s", subnet, "-p", protocol,
+                    "--dport", "53", "-j", "RETURN",
+                ]
+                if iptables_call(
+                    "mangle", ["-C", MARK_CHAIN] + dns_return
+                ).returncode != 0:
+                    return False
+
+        if BLOCK_DNS_OVER_TLS:
+            dot_tcp = [
+                "-s", subnet, "-p", "tcp", "--dport", "853",
+                "-j", "REJECT", "--reject-with", "tcp-reset",
+            ]
+            dot_udp = [
+                "-s", subnet, "-p", "udp", "--dport", "853",
+                "-j", "REJECT", "--reject-with", "icmp-port-unreachable",
+            ]
+            if any((
+                iptables_call("filter", ["-C", FORWARD_CHAIN] + dot_tcp).returncode != 0,
+                iptables_call("filter", ["-C", FORWARD_CHAIN] + dot_udp).returncode != 0,
+            )):
+                return False
+
+        mark_rule = ["-s", subnet]
+        if not FULL_ROUTE_TO_PROXY:
+            mark_rule.extend([
+                "-p", "tcp", "-m", "multiport", "--dports", "80,443,8080,8443"
+            ])
+        mark_rule.extend([
+            "-m", "set", "--match-set", IPSET_NAME, "dst",
+            "-j", "MARK", "--set-xmark", "0x1/0x1",
+        ])
+        checks = [("mangle", MARK_CHAIN, mark_rule)]
+        for output_interface in (f"{MULTI_TUN_PREFIX}+", TUN_DEV):
+            checks.extend([
+                ("filter", FORWARD_CHAIN, [
+                    "-s", subnet, "-o", output_interface, "-j", "ACCEPT",
+                ]),
+                ("filter", FORWARD_CHAIN, [
+                    "-d", subnet, "-i", output_interface,
+                    "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
+                    "-j", "ACCEPT",
+                ]),
+                ("nat", NAT_CHAIN, [
+                    "-s", subnet, "-o", output_interface, "-j", "MASQUERADE",
+                ]),
+            ])
+        if any(
+            iptables_call(table, ["-C", chain] + rule).returncode != 0
+            for table, chain, rule in checks
+        ):
+            return False
+        if block_udp:
+            udp_drop = [
+                "-s", subnet, "-p", "udp",
+                "-m", "mark", "--mark", "0x1/0x1", "-j", "DROP",
+            ]
+            if iptables_call("mangle", ["-C", MARK_CHAIN] + udp_drop).returncode != 0:
+                return False
+    return True
+
+
+def service_is_active(unit):
+    return subprocess.run(
+        ["systemctl", "is-active", "--quiet", unit],
+        timeout=15,
+    ).returncode == 0
+
+
+def dns_workers_are_ready(dns_routes):
+    if not dns_routes or not service_is_active("dnsmasq.service"):
+        return False
+    primary_address = dns_primary_address(dns_routes)
+    return all(
+        item["address"] == primary_address
+        or service_is_active(dns_worker_unit(item["address"]))
+        for item in dns_routes
+    )
+
+
+def tun_interfaces_are_ready(lanes):
+    for lane in lanes:
+        result = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show", "dev", lane["device"]],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0 or lane["gateway"] not in result.stdout:
+            return False
+    return bool(lanes)
+
+
+def policy_routing_is_ready(lanes):
+    rules = subprocess.run(
+        ["ip", "rule", "show"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    routes = subprocess.run(
+        ["ip", "route", "show", "table", PROXY_TABLE],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    rule_present = rules.returncode == 0 and any(
+        "fwmark 0x1" in line
+        and ("lookup tun2socks" in line or f"lookup {PROXY_TABLE}" in line)
+        for line in rules.stdout.splitlines()
+    )
+    route_present = routes.returncode == 0 and all(
+        f"dev {lane['device']}" in routes.stdout
+        for lane in lanes
+    )
+    return rule_present and route_present
+
+
+def ipset_is_ready():
+    return subprocess.run(
+        ["ipset", "list", IPSET_NAME],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+    ).returncode == 0
+
+
+def apply_runtime_routing(vpn_subnets, dns_routes, lanes):
+    for lane in lanes:
+        setup_tun2socks_interface(lane)
+    setup_vpn_forwarding(vpn_subnets, dns_routes)
+    setup_iptables_fwmark(vpn_subnets)
+    setup_tun2socks_routing(lanes)
+
+
+def lane_signature(lanes):
+    return tuple(sorted((lane["key"], lane["slot"], lane["proxy"]) for lane in lanes))
+
+
+def reconcile_loop(initial_subnets, initial_dns_routes, initial_lanes, initial_route_lanes):
+    known_subnets = initial_subnets
+    known_dns_routes = initial_dns_routes
+    configured_lanes = initial_lanes
+    route_lanes = initial_route_lanes
+    known_signature = lane_signature(configured_lanes)
+    last_proxy_refresh = time.monotonic()
+    while True:
+        time.sleep(RECONCILE_INTERVAL_SECONDS)
+        try:
+            if load_managed_float_states():
+                sync_managed_floating_ips_from_database()
+            current_subnets = discover_vpn_subnets()
+            current_dns_routes = discover_vpn_dns_routes()
+            dns_changed = current_dns_routes != known_dns_routes
+            if dns_changed or not dns_workers_are_ready(current_dns_routes):
+                setup_ipset()
+                primary_dns = setup_dnsmasq(current_dns_routes)
+                use_local_dnsmasq(primary_dns)
+            refresh_proxy_ipset()
+
+            proxy_list_changed = False
+            if time.monotonic() - last_proxy_refresh >= PROXY_REFRESH_SECONDS:
+                records = fetch_proxy_records()
+                refreshed_lanes, _started_lanes = prepare_proxy_lanes(records)
+                refreshed_signature = lane_signature(refreshed_lanes)
+                proxy_list_changed = refreshed_signature != known_signature
+                configured_lanes = refreshed_lanes
+                known_signature = refreshed_signature
+                last_proxy_refresh = time.monotonic()
+                if proxy_list_changed:
+                    print(f"[+] Proxy lane configuration changed: {len(configured_lanes)} lanes")
+
+            for lane in configured_lanes:
+                if not service_is_active(lane["unit"]):
+                    run_cmd(f"systemctl restart {shlex.quote(lane['unit'])}")
+
+            active_lanes = [
+                lane for lane in configured_lanes if service_is_active(lane["unit"])
+            ]
+            if not active_lanes:
+                print("[!] No tun2socks service is active; preserving the previous route")
+                continue
+
+            route_changed = {
+                lane["key"] for lane in active_lanes
+            } != {lane["key"] for lane in route_lanes}
+            runtime_ready = (
+                ipset_is_ready()
+                and tun_interfaces_are_ready(active_lanes)
+                and policy_routing_is_ready(active_lanes)
+                and dns_workers_are_ready(current_dns_routes)
+                and firewall_rules_present(current_subnets, current_dns_routes)
+            )
+            if (
+                proxy_list_changed
+                or route_changed
+                or current_subnets != known_subnets
+                or dns_changed
+                or not runtime_ready
+            ):
+                setup_ipset()
+                apply_runtime_routing(current_subnets, current_dns_routes, active_lanes)
+                activate_multi_lane_mode(active_lanes, configured_lanes)
+                known_subnets = current_subnets
+                known_dns_routes = current_dns_routes
+                route_lanes = active_lanes
+                print(
+                    f"[+] Runtime routing repaired: "
+                    f"{len(route_lanes)}/{len(configured_lanes)} active lanes"
+                )
+            else:
+                print(
+                    f"[+] Proxy routing: {len(active_lanes)}/{len(configured_lanes)} "
+                    f"active lanes"
+                )
+        except Exception as exc:
+            print(f"[!] Routing reconciliation failed: {exc}")
+
+
+# ---------------- main ----------------
+def main():
+    if os.geteuid() != 0:
+        print("[!] لطفاً با sudo اجرا کنید.")
+        sys.exit(1)
+
+    prepare_dnsmasq_install()
+    ensure_required_packages()
+    setup_install_packages()
+    setup_ipset()
+    vpn_subnets = discover_vpn_subnets()
+    dns_routes = discover_vpn_dns_routes()
+    primary_dns = setup_dnsmasq(dns_routes)
+    use_local_dnsmasq(primary_dns)
+    refresh_proxy_ipset()
+    sync_managed_floating_ips_from_database()
+    proxy_records = fetch_proxy_records()
+    configured_lanes, started_lanes = prepare_proxy_lanes(proxy_records)
+    route_lanes = started_lanes
+    apply_runtime_routing(vpn_subnets, dns_routes, route_lanes)
+    activate_multi_lane_mode(route_lanes, configured_lanes)
+
+    if use_dnstt:
+        setup_iptables_dnstt(5300)
+    print(
+        f"\n[+] Selective multi-proxy routing is active with "
+        f"{len(route_lanes)}/{len(configured_lanes)} active lanes."
+    )
+    reconcile_loop(vpn_subnets, dns_routes, configured_lanes, route_lanes)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Stopped by user.")
+    except Exception as e:
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
