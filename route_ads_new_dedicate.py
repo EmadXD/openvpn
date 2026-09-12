@@ -94,14 +94,12 @@ DOMAINS = [
     "clients.google.com",
     "csp.withgoogle.com",
     "dartsearch.net",
-    "developers.google.com",
     "doubleclick-cn.net",
     "doubleclick.de",
     "doubleclick.ne.jp",
     "doubleclick.net",
     "doubleclick.com",
     "doubleclickbygoogle.com",
-    "firebase.google.com",
     "fundingchoicesmessages.google.com",
     "g.doubleclick.net",
     "google-analytics-cn.com",
@@ -111,28 +109,19 @@ DOMAINS = [
     "googleads-cn.com",
     "googleads.com",
     "googleadsserving.cn",
-    "googleapis.cn",
-    "googleapis.com",
     "googlesyndication-cn.com",
     "googlesyndication.com",
     "googletagmanager-cn.com",
     "googletagmanager.com",
     "googletagservices.com",
-    "gstatic-cn.com",
-    "gstatic.cn",
-    "gstatic.com",
-    "gvt1.com",
     "mobileads.google.com",
     "pagead2.googlesyndication.com",
-    "play.googleapis.com",
     "pubads.g.doubleclick.net",
     "securepubads.g.doubleclick.net",
-    "support.google.com",
     "tpc.googlesyndication.com",
     "partner.googleadservices.com",
     "stats.g.doubleclick.net",
     "pagead.l.doubleclick.net",
-    "googleusercontent.com",
     "merchant-center-analytics.goog",
     "mediation.goog",
     "ssl.google-analytics.com",
@@ -140,17 +129,33 @@ DOMAINS = [
     "tagassistant.google.com",
     "tagmanager.google.com",
     "www.google.com",
-    "redirector.googlevideo.com",
-    "i.ytimg.com",
-    "yt3.ggpht.com",
-
-    "browserleaks.com", "aparatvpn.com",
-
+    "browserleaks.com",
+    "aparatvpn.com",
     "stun.l.google.com",
     "stun1.l.google.com",
     "stun2.l.google.com",
     "stun3.l.google.com",
     "stun4.l.google.com",
+    "imasdk.googleapis.com",
+    "googleads.googleapis.com",
+    "firebaseinstallations.googleapis.com",
+    "firebaseremoteconfig.googleapis.com",
+    "csi.gstatic.com",
+    "firebaselogging.googleapis.com",
+    "firebaselogging-pa.googleapis.com",
+    "firebaseremoteconfigrealtime.googleapis.com",
+    "firebaseinappmessaging.googleapis.com",
+    "ogads-pa.googleapis.com",
+    "appsgrowthpromo-pa.googleapis.com",
+    "xgapromomanager-pa.googleapis.com",
+    "youtubei.googleapis.com",
+    "clienttracing-pa.googleapis.com",
+    "googleapis.com",
+    "googleapis.cn",
+    "gstatic.com",
+    "gstatic.cn",
+    "gstatic-cn.com",
+    "redirector.googlevideo.com",
 ]
 
 # dnsmasq matches a configured domain and its subdomains, but it cannot match
@@ -2534,7 +2539,27 @@ def reconcile_loop(initial_subnets, initial_dns_routes, initial_lanes, initial_r
 
 
 # ---------------- main ----------------
+def resume_existing_proxy_routing():
+    if not MULTI_MARKER_PATH.is_file() or not BROKER_TOPOLOGY_PATH.is_file():
+        return False
+    subnets = discover_vpn_subnets()
+    dns_routes = discover_vpn_dns_routes()
+    records = load_cached_proxy_records()
+    if not records:
+        return False
+    lanes = build_lanes(records)
+    if not (ipset_is_ready() and dns_workers_are_ready(dns_routes)
+            and tun_interfaces_are_ready(lanes) and policy_routing_is_ready(lanes)
+            and firewall_rules_present(subnets, dns_routes)
+            and all(service_is_active(lane['unit']) for lane in lanes)):
+        return False
+    print('[+] Existing proxy routing adopted without restarting DNS or VPN services', flush=True)
+    reconcile_loop(subnets, dns_routes, lanes, lanes)
+    return True
+
 def main():
+    if '--resume-existing' in sys.argv and resume_existing_proxy_routing():
+        return
     if os.geteuid() != 0:
         print("[!] لطفاً با sudo اجرا کنید.")
         sys.exit(1)
