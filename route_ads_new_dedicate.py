@@ -57,8 +57,8 @@ DNS_FORWARD_MAX = 4096
 ENFORCE_VPN_DNS = True
 BLOCK_DNS_OVER_TLS = True
 RECONCILE_INTERVAL_SECONDS = 300
-PROXY_API_URL = 'https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX'
-FLOAT_IP_API_URL = 'https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=XXX'
+PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=234t5ygfdswer4t5ryutghfdsfw3re4t5y"
+FLOAT_IP_API_URL = "https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=234t5ygfdswer4t5ryutghfdsfw3re4t5y"
 TUN2SOCKS_BINARY_URL = "https://aparatvpn.com/tun2socks"
 FLOAT_STATE_DIR = Path("/etc/xd-dedicated-float")
 FLOAT_SERVICE_PREFIX = "xd-dedicated-float-"
@@ -229,6 +229,15 @@ DOMAINS = [
     "init.supersonicads.com",
     "mediation-sg2-log.pangle.io",
     "o-iab-imp-counters.mediation.unity3d.com",
+    "noti-asia.adsmoloco.com",
+    "noti-eu.adsmoloco.com",
+    "api16-access-wf-sg.pangle.io",
+    "o-iab-notifications.mediation.unity3d.com",
+    "sg-ali-ad-track-sdk.mtgglobals.com",
+    "fk-new-ssplib-hb.mtgglobals.com",
+    "sdk-bidding-d-events.inner-active.mobi",
+    "api-eu.bidmachine.io",
+    "api-us.bidmachine.io",
 ]
 
 # dnsmasq matches a configured domain and its subdomains, but it cannot match
@@ -1321,6 +1330,17 @@ def dns_primary_address(dns_routes):
     return addresses[0]
 
 
+def dns_worker_groups(dns_routes, cpu_count=None):
+    """Bound concurrent interface dumps while retaining every VPN DNS address."""
+    primary = dns_primary_address(dns_routes)
+    addresses = sorted({item['address'] for item in dns_routes}, key=ipaddress.ip_address)
+    addresses.remove(primary)
+    addresses.insert(0, primary)
+    cpus = max(1, cpu_count if cpu_count is not None else (os.cpu_count() or 1))
+    count = min(len(addresses), 32, max(1, (cpus + 7) // 8))
+    return [addresses[index::count] for index in range(count)]
+
+
 def dns_worker_config(address, tcp_limit, capacity=None):
     capacity = capacity or {"cache": DNS_CACHE_SIZE, "forward": DNS_FORWARD_MAX}
     token = dns_worker_token(address)
@@ -1339,6 +1359,103 @@ dns-forward-max={capacity['forward']}
 max-tcp-connections={tcp_limit}
 conf-file=/etc/dnsmasq.d/ipset.conf
 """
+
+
+def dns_tcp_frontend_needed(dns_routes):
+    return len(dns_routes) > 32
+
+
+def dns_tcp_frontend_config(dns_routes):
+    groups = dns_worker_groups(dns_routes)
+    primary = dns_primary_address(dns_routes)
+    threads = max(1, min(32, (os.cpu_count() or 1) // 16))
+    networks = list(ipaddress.collapse_addresses(ipaddress.ip_network(r['subnet']) for r in dns_routes))
+    return '\n'.join([
+        'server:', '    interface: 127.0.0.1@5301', f'    interface: {primary}@5301',
+        '    access-control: 127.0.0.0/8 allow',
+        *[f'    access-control: {n} allow' for n in networks],
+        '    access-control: 0.0.0.0/0 refuse', '    username: "unbound"',
+        '    chroot: ""', '    directory: "/etc/unbound"', '    pidfile: ""',
+        '    do-daemonize: no', '    do-ip6: no', '    do-udp: yes', '    do-tcp: yes',
+        '    tcp-upstream: no', f'    num-threads: {threads}', '    so-reuseport: yes',
+        '    incoming-num-tcp: 2048', '    outgoing-num-tcp: 16',
+        '    outgoing-range: 1024', '    num-queries-per-thread: 4096',
+        '    msg-cache-size: 8m', '    rrset-cache-size: 16m',
+        '    so-rcvbuf: 4194304', '    do-not-query-localhost: no',
+        '    module-config: "iterator"', '    verbosity: 0',
+        '    log-queries: no', '    log-replies: no', '    use-syslog: yes',
+        'forward-zone:', '    name: "."', '    forward-first: no',
+        # Every reply must still traverse dnsmasq's ipset policy, including
+        # after administrative set resets. Never fall back to public recursion.
+        '    forward-no-cache: yes',
+        *[f'    forward-addr: {group[0]}@53' for group in groups], '',
+    ])
+
+
+def dns_tcp_rules(dns_routes):
+    import pwd
+    uid = str(pwd.getpwnam('unbound').pw_uid)
+    primary = dns_primary_address(dns_routes)
+    networks = list(ipaddress.collapse_addresses(ipaddress.ip_network(r['subnet']) for r in dns_routes))
+    rules = []
+    for network in networks:
+        rules.append(('filter', 'INPUT', ['-s', str(network), '-d', primary, '-p', 'tcp',
+            '--dport', '5301', '-m', 'comment', '--comment', 'xd-dns-tcp-input', '-j', 'ACCEPT']))
+        rules.append(('nat', 'PREROUTING', ['-s', str(network), '-p', 'tcp', '--dport', '53',
+            '-m', 'comment', '--comment', 'xd-dns-tcp-forward', '-j', 'DNAT', '--to-destination', primary + ':5301']))
+    # Exempt Unbound itself so its rare large-answer TCP fallback cannot loop.
+    rules.append(('nat', 'OUTPUT', ['-p', 'tcp', '--dport', '53', '-m', 'addrtype',
+        '--dst-type', 'LOCAL', '-m', 'owner', '!', '--uid-owner', uid,
+        '-m', 'comment', '--comment', 'xd-dns-tcp-local', '-j', 'DNAT', '--to-destination', '127.0.0.1:5301']))
+    return rules
+
+
+def ensure_dns_tcp_rules(dns_routes):
+    for attempt in range(8):
+        checked = subprocess.run(['dig', '@127.0.0.1', '-p', '5301', '+tcp', '+time=1',
+            '+tries=1', '+short', 'googleads.g.doubleclick.net', 'A'], capture_output=True, text=True, timeout=3)
+        if checked.returncode == 0 and re.search(r'\d+\.\d+\.\d+\.\d+', checked.stdout):
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError('DNS TCP front end did not answer; previous DNS route retained')
+    for table, chain, rule in dns_tcp_rules(dns_routes):
+        if iptables_call(table, ['-C', chain] + rule).returncode != 0:
+            iptables_call(table, ['-I', chain, '1'] + rule, check=True)
+
+
+def setup_dns_tcp_frontend(dns_routes):
+    if not dns_tcp_frontend_needed(dns_routes):
+        return
+    if not Path('/usr/sbin/unbound').is_file():
+        run_cmd('DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends unbound', check=True)
+        run_cmd('systemctl disable --now unbound', check=True)
+    config_path = '/etc/unbound/xd-dns-tcp.conf'
+    changed = write_text_if_changed(config_path, dns_tcp_frontend_config(dns_routes))
+    run_cmd('unbound-checkconf ' + config_path, check=True)
+    script = str(Path(__file__).resolve())
+    unit = f'''[Unit]
+Description=VPN DNS TCP front end with local dnsmasq policy enforcement
+After=network-online.target dnsmasq.service
+Wants=network-online.target dnsmasq.service
+[Service]
+Type=simple
+ExecStart=/usr/sbin/unbound -d -c {config_path}
+ExecStartPost=/usr/bin/python3 "{script}" --dns-tcp-rules
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+TasksMax=4096
+[Install]
+WantedBy=multi-user.target
+'''
+    changed_unit = write_text_if_changed('/etc/systemd/system/xd-dns-tcp.service', unit)
+    if changed_unit:
+        run_cmd('systemctl daemon-reload', check=True)
+    run_cmd('systemctl enable xd-dns-tcp.service', check=True)
+    if changed or changed_unit or not service_is_active('xd-dns-tcp.service'):
+        run_cmd('systemctl restart xd-dns-tcp.service', check=True)
+    ensure_dns_tcp_rules(dns_routes)
 
 
 def dns_worker_service(address, config_path):
@@ -1393,12 +1510,13 @@ def cleanup_stale_dns_workers(active_addresses):
 
 
 def setup_dnsmasq(dns_routes):
-    capacity = dns_capacity(len(dns_routes))
+    groups = dns_worker_groups(dns_routes)
+    capacity = dns_capacity(len(groups))
     tcp_limit = capacity["tcp"]
     primary_address = dns_primary_address(dns_routes)
     dnsmasq_main = f"""port=53
-listen-address=127.0.0.1,{primary_address}
-bind-dynamic
+listen-address=127.0.0.1,{','.join(groups[0])}
+bind-interfaces
 conf-dir=/etc/dnsmasq.d/,*.conf
 no-resolv
 cache-size={capacity['cache']}
@@ -1419,25 +1537,25 @@ server=8.8.4.4
     changed = write_text_if_changed("/etc/dnsmasq.d/openvpn_dns.conf", dns_openvpn) or changed
     run_cmd("dnsmasq --test", check=True)
     run_cmd("systemctl enable dnsmasq", check=True)
-    if changed or not service_is_active("dnsmasq.service"):
-        run_cmd("systemctl restart dnsmasq", check=True)
 
     DNS_WORKER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(DNS_WORKER_CONFIG_DIR, 0o755)
-    worker_addresses = [
-        item["address"] for item in dns_routes if item["address"] != primary_address
-    ]
+    worker_addresses = [group[0] for group in groups[1:]]
     cleanup_stale_dns_workers(worker_addresses)
+    if changed or not service_is_active("dnsmasq.service"):
+        run_cmd("systemctl restart dnsmasq", check=True)
 
     daemon_reload = False
     changed_units = set()
-    for address in worker_addresses:
+    for group in groups[1:]:
+        address = group[0]
         token = dns_worker_token(address)
         config_path = DNS_WORKER_CONFIG_DIR / f"{token}.conf"
         unit = dns_worker_unit(address)
         unit_path = Path("/etc/systemd/system") / unit
         config_changed = write_text_if_changed(
-            config_path, dns_worker_config(address, tcp_limit, capacity), mode=0o644
+            config_path, dns_worker_config(address, tcp_limit, capacity).replace(
+                f'listen-address={address}\n', f"listen-address={','.join(group)}\n"), mode=0o644
         )
         unit_changed = write_text_if_changed(
             unit_path, dns_worker_service(address, config_path), mode=0o644
@@ -1459,10 +1577,11 @@ server=8.8.4.4
     for action, group in actions:
         dns_worker_systemctl(action, group)
 
+    setup_dns_tcp_frontend(dns_routes)
     if not dns_workers_are_ready(dns_routes):
         raise RuntimeError("one or more OpenVPN DNS workers failed to start")
     print(
-        f"[+] DNS load is distributed across {len(dns_routes)} "
+        f"[+] DNS load is distributed across {len(groups)} workers for {len(dns_routes)} "
         f"OpenVPN gateway(s); primary={primary_address}; capacity={capacity}"
     )
     return primary_address
@@ -1583,6 +1702,24 @@ def remove_legacy_rules():
     remove_rule_all("mangle", "PREROUTING", ["-j", "TUN2SOCKS"])
 
 
+def dns_fastpath_rules(dns_routes):
+    rules = []
+    subnets = list(ipaddress.collapse_addresses(
+        ipaddress.ip_network(route["subnet"], strict=False) for route in dns_routes
+    ))
+    if len(subnets) == 1:
+        rules.append([
+            "!", "-s", str(subnets[0]), "-m", "comment", "--comment",
+            "xd-dns-fastpath-source", "-j", "RETURN",
+        ])
+    for protocol in ("tcp", "udp"):
+        rules.append([
+            "-p", protocol, "!", "--dport", "53", "-m", "comment", "--comment",
+            "xd-dns-fastpath-" + protocol, "-j", "RETURN",
+        ])
+    return rules
+
+
 def setup_vpn_forwarding(vpn_subnets, dns_routes):
     setup_proxy_guard()
     ensure_chain("filter", FORWARD_CHAIN)
@@ -1597,6 +1734,11 @@ def setup_vpn_forwarding(vpn_subnets, dns_routes):
         ensure_jump("filter", "INPUT", DNS_INPUT_CHAIN)
 
     if ENFORCE_VPN_DNS:
+        # Non-DNS packets must not scan every OpenVPN worker's DNS rules.
+        # RETURN keeps their existing parent-chain policy, not a new ACCEPT.
+        for table, chain in (("nat", DNS_NAT_CHAIN), ("filter", DNS_INPUT_CHAIN)):
+            for rule in dns_fastpath_rules(dns_routes):
+                iptables_call(table, ["-A", chain] + rule, check=True)
         for route in dns_routes:
             subnet = route["subnet"]
             address = route["address"]
@@ -1870,7 +2012,7 @@ def load_cached_proxy_records():
     return normalize_proxy_records(records)
 
 
-def fetch_proxy_records():
+def fetch_proxy_records(persist=True, allow_cached=True):
     separator = "&" if "?" in PROXY_API_URL else "?"
     url = PROXY_API_URL + separator + "format=json"
     try:
@@ -1890,9 +2032,12 @@ def fetch_proxy_records():
         cache_payload = json.dumps(
             {"version": 1, "proxies": records}, sort_keys=True, separators=(",", ":")
         ) + "\n"
-        write_text_if_changed(MULTI_PROXY_CACHE_PATH, cache_payload, mode=0o600)
+        if persist:
+            write_text_if_changed(MULTI_PROXY_CACHE_PATH, cache_payload, mode=0o600)
         return records
     except Exception as exc:
+        if not allow_cached:
+            raise RuntimeError('Fresh proxy API list unavailable; existing configuration retained') from exc
         cached = load_cached_proxy_records()
         if cached:
             print(f"[!] Proxy-list fetch failed; preserving {len(cached)} cached lanes: {exc}")
@@ -2042,7 +2187,7 @@ def initial_broker_topology(records):
     ]}
 
 
-def build_lanes(records):
+def build_lanes(records, persist=True):
     topology = load_broker_topology()
     by_key = {}
     for record in records:
@@ -2079,8 +2224,9 @@ def build_lanes(records):
     # All validation/assignment finishes before the first filesystem change.
     MULTI_STATE_DIR.mkdir(parents=True, exist_ok=True)
     os.chmod(MULTI_STATE_DIR, 0o700)
-    write_text_if_changed(BROKER_TOPOLOGY_PATH,
-                          json.dumps(topology, sort_keys=True, separators=(",", ":")) + "\n", mode=0o600)
+    if persist:
+        write_text_if_changed(BROKER_TOPOLOGY_PATH,
+                              json.dumps(topology, sort_keys=True, separators=(",", ":")) + "\n", mode=0o600)
     lanes = []
     for physical in sorted(topology["lanes"], key=lambda item: item["slot"]):
         slot = physical["slot"]
@@ -2095,6 +2241,93 @@ def build_lanes(records):
 def lane_gomaxprocs(lane_count):
     cpus = max(1, os.cpu_count() or 1)
     return max(1, min(4, cpus // max(1, lane_count)))
+
+
+def refresh_proxy_configuration_only():
+    """Refresh credentials without any firewall, interface or service mutation."""
+    import fcntl
+    with open('/run/xd-proxy-refresh.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not BROKER_TOPOLOGY_PATH.is_file() or not BROKER_CONFIG.is_file():
+            raise RuntimeError('Existing broker topology required for a hot refresh')
+        records = fetch_proxy_records(persist=False, allow_cached=False)
+        before_topology = BROKER_TOPOLOGY_PATH.read_bytes()
+        before_config = BROKER_CONFIG.read_bytes()
+        temporary = BROKER_CONFIG.with_suffix('.refresh-next')
+        try:
+            lanes = build_lanes(records)
+            config = broker_config(records, lanes)
+            previous = json.loads(before_config)
+            # Keep all runtime capacity and transport tuning outside pool selection.
+            previous.update(upstreams=config['upstreams'], lanes=config['lanes'])
+            old_listeners = sorted((lane['slot'], lane['listen']) for lane in json.loads(before_config)['lanes'])
+            if old_listeners != sorted((lane['slot'], lane['listen']) for lane in previous['lanes']):
+                raise RuntimeError('Hot refresh cannot alter physical listeners')
+            payload = json.dumps(previous, sort_keys=True, separators=(',', ':')) + '\n'
+            temporary.write_text(payload)
+            temporary.chmod(0o640)
+            os.chown(temporary, 0, grp.getgrnam('xd-proxy').gr_gid)
+            checked = subprocess.run([BROKER_BINARY, '-config', str(temporary), '-check'],
+                                     capture_output=True, timeout=10)
+            if checked.returncode:
+                raise RuntimeError('Broker rejected hot refresh')
+            digest = hashlib.sha256(payload.encode()).hexdigest()
+            if before_config != payload.encode():
+                os.replace(temporary, BROKER_CONFIG)
+            for attempt in range(15):
+                try:
+                    with urllib.request.urlopen('http://127.0.0.1:19999/ready', timeout=1) as response:
+                        status = json.load(response)
+                    if status.get('ready') and status.get('config_sha256') == digest:
+                        cache = json.dumps({'version': 1, 'proxies': records}, sort_keys=True, separators=(',', ':')) + '\n'
+                        write_text_if_changed(MULTI_PROXY_CACHE_PATH, cache, mode=0o600)
+                        print(f'[+] Proxy hot refresh verified: {len(records)} upstreams; physical lanes unchanged', flush=True)
+                        return
+                except (OSError, ValueError):
+                    pass
+                time.sleep(1)
+            raise RuntimeError('Broker hot refresh readiness not confirmed')
+        except Exception:
+            write_text_if_changed(BROKER_TOPOLOGY_PATH, before_topology.decode(), mode=0o600)
+            temporary.write_bytes(before_config)
+            temporary.chmod(0o640)
+            os.chown(temporary, 0, grp.getgrnam('xd-proxy').gr_gid)
+            os.replace(temporary, BROKER_CONFIG)
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def install_proxy_refresh_timer():
+    script = str(Path(__file__).resolve())
+    if any(c in script for c in '\n\r%"'):
+        raise RuntimeError('Unsupported route script path for systemd')
+    unit = f'''[Unit]
+Description=Refresh proxy pool independently of routing reconciliation
+After=network-online.target xd-proxy-broker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 "{script}" --refresh-proxies-only
+TimeoutStartSec=75
+'''
+    timer = '''[Unit]
+Description=Refresh proxy pool every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=5s
+Unit=xd-proxy-refresh.service
+
+[Install]
+WantedBy=timers.target
+'''
+    changed = write_text_if_changed('/etc/systemd/system/xd-proxy-refresh.service', unit, mode=0o644)
+    changed = write_text_if_changed('/etc/systemd/system/xd-proxy-refresh.timer', timer, mode=0o644) or changed
+    if changed:
+        run_cmd('systemctl daemon-reload', check=True)
+    run_cmd('systemctl enable --now xd-proxy-refresh.timer', check=True)
 
 
 def broker_config(records, lanes, memory_bytes=None):
@@ -2244,6 +2477,13 @@ WantedBy=multi-user.target
 
 
 def prepare_proxy_lanes(records):
+    import fcntl
+    with open('/run/xd-proxy-refresh.lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _prepare_proxy_lanes_locked(records)
+
+
+def _prepare_proxy_lanes_locked(records):
     lanes = build_lanes(records)
     prepare_proxy_broker(records, lanes)
     changed_units = set()
@@ -2368,6 +2608,10 @@ def firewall_rules_present(vpn_subnets, dns_routes):
             return False
         if iptables_call("filter", ["-C", "INPUT", "-j", DNS_INPUT_CHAIN]).returncode != 0:
             return False
+        for table, chain in (("nat", DNS_NAT_CHAIN), ("filter", DNS_INPUT_CHAIN)):
+            for rule in dns_fastpath_rules(dns_routes):
+                if iptables_call(table, ["-C", chain] + rule).returncode != 0:
+                    return False
         for route in dns_routes:
             subnet = route["subnet"]
             address = route["address"]
@@ -2461,11 +2705,11 @@ def service_is_active(unit):
 def dns_workers_are_ready(dns_routes):
     if not dns_routes or not service_is_active("dnsmasq.service"):
         return False
-    primary_address = dns_primary_address(dns_routes)
+    if dns_tcp_frontend_needed(dns_routes) and not service_is_active('xd-dns-tcp.service'):
+        return False
     return all(
-        item["address"] == primary_address
-        or service_is_active(dns_worker_unit(item["address"]))
-        for item in dns_routes
+        service_is_active(dns_worker_unit(group[0]))
+        for group in dns_worker_groups(dns_routes)[1:]
     )
 
 
@@ -2521,6 +2765,8 @@ def apply_runtime_routing(vpn_subnets, dns_routes, lanes):
     setup_iptables_fwmark(vpn_subnets)
     setup_tun2socks_routing(lanes)
     setup_proxy_guard()
+    if dns_tcp_frontend_needed(dns_routes):
+        ensure_dns_tcp_rules(dns_routes)
     if not (dns_workers_are_ready(dns_routes) and policy_routing_is_ready(lanes) and ipset_is_ready()):
         raise RuntimeError('Routing not ready; VPN startup fence remains installed')
     remove_rule_all('filter', 'FORWARD', ['-i', 'tun+', '-m', 'comment',
@@ -2532,6 +2778,7 @@ def lane_signature(lanes):
 
 
 def reconcile_loop(initial_subnets, initial_dns_routes, initial_lanes, initial_route_lanes):
+    install_proxy_refresh_timer()
     known_subnets = initial_subnets
     known_dns_routes = initial_dns_routes
     configured_lanes = initial_lanes
@@ -2554,8 +2801,10 @@ def reconcile_loop(initial_subnets, initial_dns_routes, initial_lanes, initial_r
 
             proxy_list_changed = False
             if time.monotonic() - last_proxy_refresh >= PROXY_REFRESH_SECONDS:
-                records = fetch_proxy_records()
-                refreshed_lanes, _started_lanes = prepare_proxy_lanes(records)
+                # The separate bounded service owns pool refresh. Credential changes
+                # must never reapply physical interfaces or thousands of rules.
+                records = load_cached_proxy_records()
+                refreshed_lanes = build_lanes(records, persist=False)
                 refreshed_signature = lane_signature(refreshed_lanes)
                 proxy_list_changed = refreshed_signature != known_signature
                 configured_lanes = refreshed_lanes
@@ -2576,8 +2825,8 @@ def reconcile_loop(initial_subnets, initial_dns_routes, initial_lanes, initial_r
                 continue
 
             route_changed = {
-                lane["key"] for lane in active_lanes
-            } != {lane["key"] for lane in route_lanes}
+                lane["slot"] for lane in active_lanes
+            } != {lane["slot"] for lane in route_lanes}
             runtime_ready = (
                 ipset_is_ready()
                 and tun_interfaces_are_ready(active_lanes)
@@ -2586,8 +2835,7 @@ def reconcile_loop(initial_subnets, initial_dns_routes, initial_lanes, initial_r
                 and firewall_rules_present(current_subnets, current_dns_routes)
             )
             if (
-                proxy_list_changed
-                or route_changed
+                route_changed
                 or current_subnets != known_subnets
                 or dns_changed
                 or not runtime_ready
@@ -2620,7 +2868,7 @@ def resume_existing_proxy_routing():
     records = load_cached_proxy_records()
     if not records:
         return False
-    lanes = build_lanes(records)
+    lanes = build_lanes(records, persist=False)
     if not (ipset_is_ready() and dns_workers_are_ready(dns_routes)
             and tun_interfaces_are_ready(lanes) and policy_routing_is_ready(lanes)
             and firewall_rules_present(subnets, dns_routes)
@@ -2631,6 +2879,12 @@ def resume_existing_proxy_routing():
     return True
 
 def main():
+    if '--dns-tcp-rules' in sys.argv:
+        ensure_dns_tcp_rules(discover_vpn_dns_routes())
+        return
+    if '--refresh-proxies-only' in sys.argv:
+        refresh_proxy_configuration_only()
+        return
     if '--resume-existing' in sys.argv and resume_existing_proxy_routing():
         return
     if os.geteuid() != 0:
