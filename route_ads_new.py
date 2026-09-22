@@ -47,8 +47,8 @@ DNS_FORWARD_MAX = 4096
 ENFORCE_VPN_DNS = True
 BLOCK_DNS_OVER_TLS = True
 RECONCILE_INTERVAL_SECONDS = 300
-PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=XXX"
-FLOAT_IP_API_URL = "https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=XXX"
+PROXY_API_URL = "https://aparatvpn.com/XDvpn/api_v1/ads_proxy.php?api_key=234t5ygfdswer4t5ryutghfdsfw3re4t5y"
+FLOAT_IP_API_URL = "https://aparatvpn.com/XDvpn/api_v1/dedicated_float_pool.php?api_key=234t5ygfdswer4t5ryutghfdsfw3re4t5y"
 TUN2SOCKS_BINARY_URL = "https://aparatvpn.com/tun2socks"
 FLOAT_STATE_DIR = Path("/etc/xd-dedicated-float")
 FLOAT_SERVICE_PREFIX = "xd-dedicated-float-"
@@ -219,6 +219,15 @@ DOMAINS = [
     "init.supersonicads.com",
     "mediation-sg2-log.pangle.io",
     "o-iab-imp-counters.mediation.unity3d.com",
+    "noti-asia.adsmoloco.com",
+    "noti-eu.adsmoloco.com",
+    "api16-access-wf-sg.pangle.io",
+    "o-iab-notifications.mediation.unity3d.com",
+    "sg-ali-ad-track-sdk.mtgglobals.com",
+    "fk-new-ssplib-hb.mtgglobals.com",
+    "sdk-bidding-d-events.inner-active.mobi",
+    "api-eu.bidmachine.io",
+    "api-us.bidmachine.io",
 ]
 
 # dnsmasq matches a configured domain and its subdomains, but it cannot match
