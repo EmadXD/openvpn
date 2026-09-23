@@ -228,6 +228,8 @@ DOMAINS = [
     "sdk-bidding-d-events.inner-active.mobi",
     "api-eu.bidmachine.io",
     "api-us.bidmachine.io",
+    "vg-new-hb-bid-feedback.mtgglobals.com",
+    "supply.inmobicdn.net",
 ]
 
 # dnsmasq matches a configured domain and its subdomains, but it cannot match
