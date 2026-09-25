@@ -1412,6 +1412,27 @@ def dns_tcp_rules(dns_routes):
     return rules
 
 
+def dns_tcp_rule_is_shadowed(listing, rule):
+    source = rule[rule.index('-s') + 1]
+    destination = rule[rule.index('--to-destination') + 1]
+    jump_position = None
+    matching_positions = []
+    for position, line in enumerate(listing.splitlines()):
+        parts = shlex.split(line)
+        if parts[:2] != ['-A', 'PREROUTING']:
+            continue
+        if '-j' in parts and parts[parts.index('-j') + 1] == DNS_NAT_CHAIN:
+            if jump_position is None:
+                jump_position = position
+        if all(key in parts for key in ('--comment', '-s', '--to-destination')):
+            if (parts[parts.index('--comment') + 1] == 'xd-dns-tcp-forward'
+                    and parts[parts.index('-s') + 1] == source
+                    and parts[parts.index('--to-destination') + 1] == destination):
+                matching_positions.append(position)
+    return bool(jump_position is not None and matching_positions
+                and min(matching_positions) > jump_position)
+
+
 def ensure_dns_tcp_rules(dns_routes):
     for attempt in range(8):
         checked = subprocess.run(['dig', '@127.0.0.1', '-p', '5301', '+tcp', '+time=1',
@@ -1422,7 +1443,13 @@ def ensure_dns_tcp_rules(dns_routes):
     else:
         raise RuntimeError('DNS TCP front end did not answer; previous DNS route retained')
     for table, chain, rule in dns_tcp_rules(dns_routes):
-        if iptables_call(table, ['-C', chain] + rule).returncode != 0:
+        missing = iptables_call(table, ['-C', chain] + rule).returncode != 0
+        shadowed = False
+        if not missing and table == 'nat' and chain == 'PREROUTING':
+            listing = iptables_call(table, ['-S', chain], check=True).stdout
+            shadowed = dns_tcp_rule_is_shadowed(listing, rule)
+        if missing or shadowed:
+            # Prepend before legacy DNAT; leave the old rule as a harmless fallback.
             iptables_call(table, ['-I', chain, '1'] + rule, check=True)
 
 
