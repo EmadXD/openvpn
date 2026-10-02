@@ -856,6 +856,10 @@ def tune_network_interfaces() -> Tuple[int, List[str]]:
     ethtool = shutil.which("ethtool")
 
     for interface in physical_interfaces():
+        # Preserve ICE defaults on this host while diagnosing IOVA/driver stalls.
+        driver = Path(f"/sys/class/net/{interface}/device/driver")
+        if driver.is_symlink() and driver.resolve().name == "ice":
+            continue
         qlen = run(["ip", "link", "set", "dev", interface, "txqueuelen", "10000"])
         if qlen.returncode == 0:
             success += 1
